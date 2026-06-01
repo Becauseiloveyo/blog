@@ -1,5 +1,42 @@
 (() => {
   const root = document.documentElement;
+
+  const forceCodeStyle = document.createElement('style');
+  forceCodeStyle.setAttribute('data-blog-code-override', 'true');
+  forceCodeStyle.textContent = `
+    body pre,
+    body pre.hljs,
+    body main pre,
+    body article pre,
+    body .article pre,
+    body .prose pre {
+      background: linear-gradient(180deg, #fffdf8, #f8eddd) !important;
+      color: #3a3028 !important;
+      border: 1px solid #decbb2 !important;
+      box-shadow: 0 12px 34px rgba(82,55,30,.08) !important;
+      border-radius: 18px !important;
+    }
+    body pre code,
+    body pre code.hljs,
+    body code.hljs,
+    body .hljs {
+      background: transparent !important;
+      color: #3a3028 !important;
+      text-shadow: none !important;
+    }
+    body pre .hljs-keyword,
+    body pre .hljs-selector-tag,
+    body pre .hljs-built_in { color: #9a3412 !important; }
+    body pre .hljs-string,
+    body pre .hljs-title,
+    body pre .hljs-name { color: #166534 !important; }
+    body pre .hljs-number,
+    body pre .hljs-literal { color: #1d4ed8 !important; }
+    body pre .hljs-comment,
+    body pre .hljs-quote { color: #8b7d6f !important; font-style: italic; }
+  `;
+  document.head.appendChild(forceCodeStyle);
+
   const saved = localStorage.getItem('theme');
   if (saved) root.dataset.theme = saved;
   else if (window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches) root.dataset.theme = 'dark';
@@ -29,7 +66,7 @@
     document.querySelectorAll('.fade,.card,.toc,.comments').forEach(reveal);
   }
 
-  document.querySelectorAll('.prose pre').forEach(pre => {
+  document.querySelectorAll('pre').forEach(pre => {
     if (pre.parentElement?.classList.contains('code-wrap')) return;
     const wrap = document.createElement('div');
     wrap.className = 'code-wrap';
