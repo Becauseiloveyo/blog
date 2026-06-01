@@ -19,13 +19,48 @@ jobs:
           port: ${{ secrets.SERVER_PORT || 22 }}
           script: |
             set -e
-            if [ ! -d "$HOME/my-blog/.git" ]; then
-              rm -rf "$HOME/my-blog"
-              git clone https://github.com/Becauseiloveyo/blog.git "$HOME/my-blog"
+            APP_DIR="$HOME/my-blog"
+            REPO_URL="https://github.com/Becauseiloveyo/blog.git"
+
+            if ! command -v git >/dev/null 2>&1; then
+              apt-get update
+              apt-get install -y git
             fi
-            cd "$HOME/my-blog"
+
+            if ! command -v node >/dev/null 2>&1; then
+              curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
+              apt-get install -y nodejs
+            fi
+
+            if ! command -v pm2 >/dev/null 2>&1; then
+              npm install -g pm2
+            fi
+
+            if [ -d "$APP_DIR" ] && [ ! -d "$APP_DIR/.git" ]; then
+              TS=$(date +%Y%m%d%H%M%S)
+              mkdir -p "$HOME/blog-backups/$TS"
+              [ -d "$APP_DIR/data" ] && cp -a "$APP_DIR/data" "$HOME/blog-backups/$TS/data"
+              [ -d "$APP_DIR/public/uploads" ] && mkdir -p "$HOME/blog-backups/$TS/public" && cp -a "$APP_DIR/public/uploads" "$HOME/blog-backups/$TS/public/uploads"
+              [ -f "$APP_DIR/.env" ] && cp -a "$APP_DIR/.env" "$HOME/blog-backups/$TS/.env"
+              mv "$APP_DIR" "$HOME/blog-backups/$TS/old-my-blog"
+              git clone "$REPO_URL" "$APP_DIR"
+              [ -d "$HOME/blog-backups/$TS/data" ] && cp -a "$HOME/blog-backups/$TS/data" "$APP_DIR/data"
+              [ -d "$HOME/blog-backups/$TS/public/uploads" ] && mkdir -p "$APP_DIR/public" && cp -a "$HOME/blog-backups/$TS/public/uploads" "$APP_DIR/public/uploads"
+              [ -f "$HOME/blog-backups/$TS/.env" ] && cp -a "$HOME/blog-backups/$TS/.env" "$APP_DIR/.env"
+            elif [ ! -d "$APP_DIR/.git" ]; then
+              git clone "$REPO_URL" "$APP_DIR"
+            fi
+
+            cd "$APP_DIR"
             git fetch --all
             git reset --hard origin/main
+
+            mkdir -p data public/uploads
+            if [ ! -f .env ]; then
+              cp .env.example .env
+              echo "Created .env from .env.example. Edit it on the server to set strong secrets."
+            fi
+
             npm install --omit=dev
             pm2 restart moyan-blog || pm2 start server.js --name moyan-blog
             pm2 save
