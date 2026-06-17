@@ -10,7 +10,8 @@
     "check": "node --check server.js",
     "seed:content": "node scripts/seed-content.js",
     "upgrade:report": "node scripts/apply-report-upgrade.js",
-    "upgrade:features": "node scripts/upgrade-features.js"
+    "upgrade:features": "node scripts/upgrade-features.js",
+    "optimize:features": "node scripts/optimize-features.js"
   },
   "dependencies": {
     "bcryptjs": "^2.4.3",
