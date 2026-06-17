@@ -62,5 +62,8 @@ jobs:
             fi
 
             npm install --omit=dev
+            npm run upgrade:report || true
+            npm run upgrade:features
+            node --check server.js
             pm2 restart moyan-blog || pm2 start server.js --name moyan-blog
             pm2 save
