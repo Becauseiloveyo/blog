@@ -34,7 +34,13 @@ if (!s.includes('COURSE_FEATURES_V2')) {
   ].join('\n');
 
   s = s.replace("app.use((req, res) => res.status(404)", block + "\napp.use((req, res) => res.status(404)");
-  fs.writeFileSync(serverPath, s);
 }
 
+if (!s.includes('COURSE_FEATURES_NAV_V3')) {
+  s = s.replace(/function nav\(active = ''\) \{[\s\S]*?\nfunction layout/, "function nav(active = '') { const siteInfo = site(); const a = p => active === p ? 'active' : ''; return '<nav class=\"nav\"><div class=\"nav-inner\"><a class=\"brand\" href=\"/\"><span>'+esc(siteInfo.logo)+'</span><b>'+esc(siteInfo.name)+'</b></a><button class=\"menu-btn\" onclick=\"toggleMenu()\">☰</button><div class=\"nav-links\"><a class=\"'+a('/')+'\" href=\"/\">首页</a><a class=\"'+a('/posts')+'\" href=\"/posts\">博客列表</a><a class=\"'+a('/recommend')+'\" href=\"/recommend\">推荐</a><a class=\"'+a('/archive')+'\" href=\"/archive\">归档</a><a class=\"'+a('/about')+'\" href=\"/about\">关于</a><a class=\"'+a('/write')+'\" href=\"/write\">发布</a><a class=\"'+a('/dashboard')+'\" href=\"/dashboard\">管理</a><a class=\"'+a('/login')+'\" href=\"/login\">登录</a><button class=\"theme-btn\" onclick=\"toggleTheme()\">明暗</button></div></div></nav>'; }\n// COURSE_FEATURES_NAV_V3\nfunction layout");
+  s = s.replace(/<link rel="preconnect" href="https:\/\/cdnjs\.cloudflare\.com"><link rel="stylesheet" href="https:\/\/cdnjs\.cloudflare\.com\/ajax\/libs\/highlight\.js\/11\.11\.1\/styles\/github-dark\.min\.css"><link rel="stylesheet" href="\/assets\/app\.css">/g, '<link rel="stylesheet" href="/assets/app.css?v=course-features-v3">');
+  s = s.replace(/<script src="\/assets\/app\.js"><\/script>/g, '<script src="/assets/app.js?v=course-features-v3"></script>');
+}
+
+fs.writeFileSync(serverPath, s);
 console.log('features upgraded safely');
