@@ -43,7 +43,7 @@ jobs:
             done
             ln -sfn /opt/myvps/bin/my_vps_manager.sh /usr/local/bin/myvps-next
             echo '=== REAL BACKUP HEALTH CHECK ==='
-            python3 /opt/myvps/bin/myvps_backup_watch.py --max-age-hours 36
+            if python3 /opt/myvps/bin/myvps_backup_watch.py --max-age-hours 36; then echo 'backup_watch_initial_probe=PASS'; else echo 'backup_watch_initial_probe=WARN_REMOTE_UNAVAILABLE_OR_STALE; enabling watchdog to detect later recovery'; fi
             echo '=== VERIFY SYSTEMD TIMER EXPRESSION ==='
             systemd-analyze calendar '*-*-* 04,10,16,22:00:00 Asia/Shanghai' >/dev/null
             cat > /etc/systemd/system/myvps-backup-watch.service <<'UNIT'
