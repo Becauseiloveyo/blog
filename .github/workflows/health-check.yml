@@ -1,4 +1,4 @@
-name: Temporary VPS chain and security audit
+name: Temporary VPS end-to-end SOCKS verification
 on:
   push:
     branches:
@@ -12,72 +12,88 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - name: Read-only chain routing and firewall inspection
+      - name: Read-only end-to-end SOCKS5 authentication and egress check
         uses: appleboy/ssh-action@v1.0.3
         with:
           host: ${{ secrets.SERVER_HOST }}
           username: ${{ secrets.SERVER_USER }}
           key: ${{ secrets.SERVER_SSH_KEY }}
           port: ${{ secrets.SERVER_PORT || 22 }}
-          timeout: 40s
+          timeout: 35s
           command_timeout: 180s
           script_stop: false
           script: |
             set +e
             export LC_ALL=C
-            echo '=== XRAY CHAIN ROUTING ==='
-            p=/etc/xray-racknerd-443/config.json
-            if [ -r "$p" ] && command -v jq >/dev/null 2>&1; then
-            jq -r '(.outbounds|map(select(.protocol=="socks"))|first|.tag) as $s | "socks_outbound_configured="+($s!=null|tostring),"socks_outbound_first="+(.outbounds[0].protocol=="socks"|tostring),"routing_rule_count="+((.routing.rules//[]|length)|tostring),"rules_to_socks="+([.routing.rules[]?|select(.outboundTag==$s)]|length|tostring),"socks_server_count="+([.outbounds[]?|select(.protocol=="socks")|.settings.servers[]?]|length|tostring),"socks_auth_user_count="+([.outbounds[]?|select(.protocol=="socks")|.settings.servers[]?.users[]?]|length|tostring),"inbound_security="+([.inbounds[]?.streamSettings?.security]|join(","))' "$p" 2>/dev/null
+            echo '=== ROUTING DETAILS ==='
+            jq -r '(.outbounds|map(select(.protocol=="socks"))|first|.tag) as $s | .routing.rules[]? | "targets_socks="+(.outboundTag==$s|tostring)+" match_inbound="+(has("inboundTag")|tostring)+" match_domain="+(has("domain")|tostring)+" match_ip="+(has("ip")|tostring)+" match_port="+(has("port")|tostring)+" match_network="+(has("network")|tostring)' /etc/xray-racknerd-443/config.json 2>/dev/null
+            echo '=== END TO END SOCKS5 ==='
             python3 - <<'PY'
-            import json,socket
+            import json, socket, ssl, urllib.request
             p='/etc/xray-racknerd-443/config.json'
+            def read_exact(s,n):
+             b=b''
+             while len(b)<n:
+              chunk=s.recv(n-len(b))
+              if not chunk: raise RuntimeError('EOF')
+              b+=chunk
+             return b
             try:
-              data=json.load(open(p))
-              upstream=[a for o in data.get('outbounds',[]) if o.get('protocol')=='socks' for a in o.get('settings',{}).get('servers',[])]
-              for i,s in enumerate(upstream[:3],1):
-                host=s.get('address'); port=s.get('port')
-                if not host or not port: print(f'upstream_{i}=MISSING_HOST_OR_PORT'); continue
-                try:
-                  sock=socket.create_connection((host,int(port)),timeout=5); sock.close(); print(f'upstream_{i}=TCP_CONNECTED')
-                except TimeoutError: print(f'upstream_{i}=TCP_TIMEOUT')
-                except ConnectionRefusedError: print(f'upstream_{i}=TCP_REFUSED')
-                except OSError as e: print(f'upstream_{i}=NETWORK_{type(e).__name__}')
-            except (OSError,ValueError) as e: print('upstream_check=CONFIG_UNREADABLE')
+             cfg=json.load(open(p))
+             out=next(v for v in cfg['outbounds'] if v.get('protocol')=='socks')
+             server=out['settings']['servers'][0]
+             users=server.get('users') or []
+             auth=users[0] if users else {}
+             s=socket.create_connection((server['address'],int(server['port'])),timeout=8)
+             s.settimeout(8)
+             methods=b'\x00\x02' if auth else b'\x00'
+             s.sendall(b'\x05'+bytes([len(methods)])+methods)
+             m=read_exact(s,2)
+             if m[0]!=5 or m[1]==255: raise RuntimeError('Method rejected')
+             if m[1]==2:
+              u=str(auth.get('user',auth.get('username',''))).encode()
+              pw=str(auth.get('pass',auth.get('password',''))).encode()
+              if not (0<len(u)<=255 and 0<len(pw)<=255): raise RuntimeError('Missing credentials')
+              s.sendall(b'\x01'+bytes([len(u)])+u+bytes([len(pw)])+pw)
+              if read_exact(s,2)!=b'\x01\x00': raise RuntimeError('Authentication rejected')
+             print('socks_auth=OK')
+             host='www.cloudflare.com'; name=host.encode()
+             s.sendall(b'\x05\x01\x00\x03'+bytes([len(name)])+name+(443).to_bytes(2,'big'))
+             h=read_exact(s,4)
+             if h[1]!=0: raise RuntimeError('SOCKS target connect refused')
+             n={1:4,4:16}.get(h[3]); n=read_exact(s,1)[0] if h[3]==3 else n
+             if n is None: raise RuntimeError('Unknown SOCKS addr type')
+             read_exact(s,n+2)
+             print('socks_tunnel_to_https=OK')
+             with ssl.create_default_context().wrap_socket(s,server_hostname=host) as tls:
+              tls.sendall(b'GET /cdn-cgi/trace HTTP/1.1\r\nHost: www.cloudflare.com\r\nUser-Agent: MyVPS-health-check\r\nConnection: close\r\n\r\n')
+              buf=b''
+              while len(buf)<32768:
+               try: b=tls.recv(4096)
+               except TimeoutError: break
+               if not b: break
+               buf+=b
+              head,_,body=buf.partition(b'\r\n\r\n')
+              status=head.split(b'\r\n')[0].decode(errors='replace')
+              print('socks_tls_http='+('OK' if b' 200 ' in head.split(b'\r\n')[0] else 'HTTP_NON_200'))
+              proxied_ip=next((x[3:] for x in body.decode(errors='ignore').splitlines() if x.startswith('ip=')),None)
+             try:
+              req=urllib.request.Request('https://www.cloudflare.com/cdn-cgi/trace',headers={'User-Agent':'MyVPS-health-check'})
+              direct=urllib.request.build_opener(urllib.request.ProxyHandler({})).open(req,timeout=8).read().decode(errors='ignore')
+              native_ip=next((x[3:] for x in direct.splitlines() if x.startswith('ip=')),None)
+              print('proxy_exit_differs_from_native='+str(proxied_ip!=native_ip).lower() if proxied_ip and native_ip else 'proxy_exit_comparison=UNAVAILABLE')
+             except Exception: print('direct_exit_comparison=UNAVAILABLE')
+            except Exception as e:
+             print('socks_end_to_end=FAILED_'+type(e).__name__)
             PY
-            fi
-            echo '=== 443 NGINX STREAM ==='
-            if command -v ss >/dev/null 2>&1; then
-             for port in 80 443 3000; do
-              owner=$(ss -H -lntp | awk -v p="$port" '$4 ~ ":"p"$" {print $0;exit}' | sed -nE 's/.*users:\(\("([^"]+)".*/\1/p')
-              echo "listener_${port}_process=$owner"
-             done
-            fi
-            if command -v nginx >/dev/null 2>&1; then
-             conf=$(nginx -T 2>/dev/null)
-             echo "nginx_stream_sections=$(printf '%s\n' "$conf" | grep -Ec '^[[:space:]]*stream[[:space:]]*\{' || true)"
-             echo "nginx_proxy_pass_lines=$(printf '%s\n' "$conf" | grep -Ec '^[[:space:]]*proxy_pass[[:space:]]+' || true)"
-            fi
-            echo '=== SECURITY SSL ==='
-            if command -v fail2ban-client >/dev/null 2>&1; then
-             fail2ban-client status 2>/dev/null | sed -nE 's/.*Number of jail:[[:space:]]*([0-9]+).*/fail2ban_jails=\1/p'
-            fi
-            if command -v ufw >/dev/null 2>&1; then ufw status | head -1 | sed 's/^/ufw_state=/'; else echo ufw=not_installed; fi
-            if command -v nft >/dev/null 2>&1; then echo nft=installed; fi
-            if command -v iptables >/dev/null 2>&1; then echo iptables=installed; fi
-            if command -v openssl >/dev/null 2>&1; then
-             for dir in /etc/letsencrypt/live /etc/nginx/ssl; do
-              if [ -d "$dir" ]; then
-               printf 'tls_directory_%s=present\n' "$(basename "$dir")"
-               find "$dir" -maxdepth 2 -name fullchain.pem -type l 2>/dev/null | while read -r cert; do
-                 if openssl x509 -checkend 2592000 -noout -in "$cert" >/dev/null 2>&1; then echo 'tls_cert=valid_over_30_days'; else echo 'tls_cert=expires_within_30_days_or_unreadable'; fi
-               done
-              fi
-             done
-            fi
-            echo '=== CRON SYSTEM WIDE ==='
-            printf 'root_cron_count='; (crontab -l 2>/dev/null || true) | awk 'NF && $1 !~ /^#/{n++}END{print n+0}'
-            printf 'etc_cron_backup_refs='; grep -R -El '(rclone|backup)' /etc/cron.d /etc/cron.daily /etc/crontab 2>/dev/null | wc -l
-            printf 'system_backup_timers='; systemctl list-timers --all --no-legend 2>/dev/null | grep -Eic 'backup|rclone' || true
-            printf 'rclone_remotes_count='; rclone listremotes 2>/dev/null | wc -l
-            echo '=== END SECOND PASS ==='
+            echo '=== CRON AND FILTER SUMMARY ==='
+            crontab -l 2>/dev/null | awk 'NF && $1 !~ /^#/ {print "root_cron_schedule=" $1 " " $2 " " $3 " " $4 " " $5}'
+            for t in $(systemctl list-timers --all --no-legend 2>/dev/null | awk '$0~/backup|rclone/{for(i=1;i<=NF;i++) if($i~/\.timer$/){print $i}}' | sort -u); do echo "backup_named_timer=$t"; done
+            printf 'nft_ruleset_available='; if command -v nft >/dev/null 2>&1 && nft list ruleset >/dev/null 2>&1; then echo yes; else echo no; fi
+            echo '=== END ==='
+      - name: Public web response check (outside VPS)
+        run: |
+          for h in blog.gooffu.tech cf.gooffu.tech; do
+            out=$(curl -4 -L -sS -o /dev/null --connect-timeout 6 --max-time 12 -w '%{http_code}|%{ssl_verify_result}' "https://$h/" 2>/dev/null)
+            echo "public_${h}=${out:-unreachable}"
+          done
