@@ -1,4 +1,4 @@
-name: Temporary VPS broad read-only audit
+name: Temporary VPS chain and security audit
 on:
   push:
     branches:
@@ -12,60 +12,72 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - name: Read sanitized VPS health data over existing SSH
+      - name: Read-only chain routing and firewall inspection
         uses: appleboy/ssh-action@v1.0.3
         with:
           host: ${{ secrets.SERVER_HOST }}
           username: ${{ secrets.SERVER_USER }}
           key: ${{ secrets.SERVER_SSH_KEY }}
           port: ${{ secrets.SERVER_PORT || 22 }}
-          timeout: 35s
+          timeout: 40s
           command_timeout: 180s
           script_stop: false
           script: |
             set +e
             export LC_ALL=C
-            echo '=== SERVER RESOURCE ==='
-            . /etc/os-release; echo "os=$PRETTY_NAME"
-            printf 'time='; date -u '+%FT%TZ'
-            printf 'uptime='; uptime -p
-            printf 'cpu='; nproc
-            free -m | awk '/^Mem:/{print "mem_total_mb=" $2 " mem_available_mb=" $7} /^Swap:/{print "swap_total_mb=" $2 " swap_used_mb=" $3}'
-            df -h / | awk 'NR==2{print "root_size=" $2 " used=" $3 " free=" $4 " utilization=" $5}'
-            printf 'failed_units='; systemctl --failed --plain --no-legend 2>/dev/null | awk 'NF{n++} END{print n+0}'
-            echo '=== SERVICES ==='
-            for s in ssh nginx xray xray-racknerd-443 myvps-xray fail2ban cron docker wg-quick@warp warp-svc cloudflared AdGuardHome adguardhome; do printf '%s=%s\n' "$s" "$(systemctl is-active "$s" 2>/dev/null)"; done
-            echo '=== LISTENERS ==='
-            for p in 22 80 443 3000 8443 2053 15593 15594 1080 10808; do n=$(ss -H -lnt 2>/dev/null | awk '{print $4}' | grep -Ec ":$p$" || true); echo "tcp_$p=$n"; done
-            echo '=== XRAY ==='
-            for b in /usr/local/bin/xray /usr/bin/xray /opt/myvps/xray/xray; do if [ -x "$b" ]; then printf 'xray_version='; "$b" version 2>/dev/null | head -1; break; fi; done
-            if command -v nginx >/dev/null 2>&1; then nginx -t >/dev/null 2>&1 && echo nginx_syntax=PASS || echo nginx_syntax=FAIL; fi
-            for c in /etc/xray-racknerd-443/config.json /usr/local/etc/xray/config.json /etc/xray/config.json /etc/myvps/xray/config.json /etc/sing-box/config.json; do
-              if [ -r "$c" ]; then
-                case "$c" in */xray-racknerd-443/*) k=reality;; */myvps/*) k=myvps;; */sing-box/*) k=singbox;; *) k=xray_other;; esac
-                echo "config_${k}=PRESENT"
-                if command -v jq >/dev/null 2>&1; then
-                  jq -r --arg k "$k" '"in_"+$k+"="+([.inbounds[]?|.protocol//.type//"unknown"]|sort|group_by(.)|map(.[0]+":"+(length|tostring))|join(",")),"out_"+$k+"="+([.outbounds[]?|.protocol//.type//"unknown"]|sort|group_by(.)|map(.[0]+":"+(length|tostring))|join(",")),"transport_"+$k+"="+([.inbounds[]?|.streamSettings?.network//.transport?.type//"default"]|sort|group_by(.)|map(.[0]+":"+(length|tostring))|join(",")),"route_"+$k+"="+((.routing.rules//.route.rules//[]|length)|tostring)' "$c" 2>/dev/null || echo "parse_$k=FAIL"
-                fi
-                if [ -n "$b" ]; then "$b" run -test -config "$c" >/dev/null 2>&1 && echo "xray_test_${k}=PASS" || echo "xray_test_${k}=FAIL_OR_DIFFERENT_CORE"; fi
+            echo '=== XRAY CHAIN ROUTING ==='
+            p=/etc/xray-racknerd-443/config.json
+            if [ -r "$p" ] && command -v jq >/dev/null 2>&1; then
+            jq -r '(.outbounds|map(select(.protocol=="socks"))|first|.tag) as $s | "socks_outbound_configured="+($s!=null|tostring),"socks_outbound_first="+(.outbounds[0].protocol=="socks"|tostring),"routing_rule_count="+((.routing.rules//[]|length)|tostring),"rules_to_socks="+([.routing.rules[]?|select(.outboundTag==$s)]|length|tostring),"socks_server_count="+([.outbounds[]?|select(.protocol=="socks")|.settings.servers[]?]|length|tostring),"socks_auth_user_count="+([.outbounds[]?|select(.protocol=="socks")|.settings.servers[]?.users[]?]|length|tostring),"inbound_security="+([.inbounds[]?.streamSettings?.security]|join(","))' "$p" 2>/dev/null
+            python3 - <<'PY'
+            import json,socket
+            p='/etc/xray-racknerd-443/config.json'
+            try:
+              data=json.load(open(p))
+              upstream=[a for o in data.get('outbounds',[]) if o.get('protocol')=='socks' for a in o.get('settings',{}).get('servers',[])]
+              for i,s in enumerate(upstream[:3],1):
+                host=s.get('address'); port=s.get('port')
+                if not host or not port: print(f'upstream_{i}=MISSING_HOST_OR_PORT'); continue
+                try:
+                  sock=socket.create_connection((host,int(port)),timeout=5); sock.close(); print(f'upstream_{i}=TCP_CONNECTED')
+                except TimeoutError: print(f'upstream_{i}=TCP_TIMEOUT')
+                except ConnectionRefusedError: print(f'upstream_{i}=TCP_REFUSED')
+                except OSError as e: print(f'upstream_{i}=NETWORK_{type(e).__name__}')
+            except (OSError,ValueError) as e: print('upstream_check=CONFIG_UNREADABLE')
+            PY
+            fi
+            echo '=== 443 NGINX STREAM ==='
+            if command -v ss >/dev/null 2>&1; then
+             for port in 80 443 3000; do
+              owner=$(ss -H -lntp | awk -v p="$port" '$4 ~ ":"p"$" {print $0;exit}' | sed -nE 's/.*users:\(\("([^"]+)".*/\1/p')
+              echo "listener_${port}_process=$owner"
+             done
+            fi
+            if command -v nginx >/dev/null 2>&1; then
+             conf=$(nginx -T 2>/dev/null)
+             echo "nginx_stream_sections=$(printf '%s\n' "$conf" | grep -Ec '^[[:space:]]*stream[[:space:]]*\{' || true)"
+             echo "nginx_proxy_pass_lines=$(printf '%s\n' "$conf" | grep -Ec '^[[:space:]]*proxy_pass[[:space:]]+' || true)"
+            fi
+            echo '=== SECURITY SSL ==='
+            if command -v fail2ban-client >/dev/null 2>&1; then
+             fail2ban-client status 2>/dev/null | sed -nE 's/.*Number of jail:[[:space:]]*([0-9]+).*/fail2ban_jails=\1/p'
+            fi
+            if command -v ufw >/dev/null 2>&1; then ufw status | head -1 | sed 's/^/ufw_state=/'; else echo ufw=not_installed; fi
+            if command -v nft >/dev/null 2>&1; then echo nft=installed; fi
+            if command -v iptables >/dev/null 2>&1; then echo iptables=installed; fi
+            if command -v openssl >/dev/null 2>&1; then
+             for dir in /etc/letsencrypt/live /etc/nginx/ssl; do
+              if [ -d "$dir" ]; then
+               printf 'tls_directory_%s=present\n' "$(basename "$dir")"
+               find "$dir" -maxdepth 2 -name fullchain.pem -type l 2>/dev/null | while read -r cert; do
+                 if openssl x509 -checkend 2592000 -noout -in "$cert" >/dev/null 2>&1; then echo 'tls_cert=valid_over_30_days'; else echo 'tls_cert=expires_within_30_days_or_unreadable'; fi
+               done
               fi
-            done
-            echo '=== CHAIN EXIT WARP ==='
-            for f in /root/my_vps_exit_manager.sh /root/my_vps_manager.sh /usr/local/bin/myvps; do if [ -f "$f" ]; then echo "script_$(basename "$f")=present"; else echo "script_$(basename "$f")=absent"; fi; done
-            for cmd in wg wg-quick warp-cli rclone; do command -v "$cmd" >/dev/null 2>&1 && echo "tool_$cmd=yes" || echo "tool_$cmd=no"; done
-            printf 'wg_interface_count='; (command -v wg >/dev/null 2>&1 && wg show interfaces 2>/dev/null || true) | wc -w
-            printf 'warp_or_wg_link_count='; ip -o link show 2>/dev/null | grep -Eic 'warp|wg[0-9]|wireguard' || true
-            printf 'default_route_device='; ip -4 route show default | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1);exit}}'
-            printf 'routing_rule_count='; ip -4 rule show | wc -l
-            echo '=== SSH FIREWALL BACKUPS ==='
-            for k in passwordauthentication permitrootlogin pubkeyauthentication; do v=$(/usr/sbin/sshd -T 2>/dev/null | awk -v k="$k" '$1==k{print $2;exit}'); echo "ssh_$k=$v"; done
-            if command -v ufw >/dev/null 2>&1; then ufw status | head -1 | sed 's/^/ufw=/'; fi
-            if command -v fail2ban-client >/dev/null 2>&1; then fail2ban-client ping >/dev/null 2>&1 && echo fail2ban_api=OK || echo fail2ban_api=FAIL; fi
-            printf 'cron_entries='; (crontab -l 2>/dev/null || true) | awk 'NF && $1 !~ /^#/{n++} END{print n+0}'
-            printf 'cron_backup_refs='; (crontab -l 2>/dev/null || true) | grep -Eic 'backup|rclone' || true
-            for t in myvps-backup-vps.timer myvps-backup-blog.timer certbot.timer; do echo "timer_$t=$(systemctl is-enabled "$t" 2>/dev/null)"; done
-            printf 'rclone_remote_count='; (rclone listremotes 2>/dev/null || true) | wc -l
-            echo '=== BLOG DNS HTTPS ==='
-            if command -v pm2 >/dev/null 2>&1 && command -v jq >/dev/null 2>&1; then pm2 jlist 2>/dev/null | jq -r '.[]|"pm2="+(.name//"unknown")+" status="+(.pm2_env.status//"unknown")' 2>/dev/null; fi
-            for host in blog.gooffu.tech cf.gooffu.tech; do result=$(curl -4 -L -sS --connect-timeout 5 --max-time 12 -o /dev/null -w '%{http_code}|%{ssl_verify_result}' "https://$host" 2>/dev/null); echo "https_$host=$result"; done
-            echo '=== FINISHED ==='
+             done
+            fi
+            echo '=== CRON SYSTEM WIDE ==='
+            printf 'root_cron_count='; (crontab -l 2>/dev/null || true) | awk 'NF && $1 !~ /^#/{n++}END{print n+0}'
+            printf 'etc_cron_backup_refs='; grep -R -El '(rclone|backup)' /etc/cron.d /etc/cron.daily /etc/crontab 2>/dev/null | wc -l
+            printf 'system_backup_timers='; systemctl list-timers --all --no-legend 2>/dev/null | grep -Eic 'backup|rclone' || true
+            printf 'rclone_remotes_count='; rclone listremotes 2>/dev/null | wc -l
+            echo '=== END SECOND PASS ==='
