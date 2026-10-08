@@ -1,0 +1,134 @@
+name: Temporary isolated XHTTP add-on deployment
+on:
+  push:
+    branches:
+      - ops/read-only-vps-audit-20261008
+    paths:
+      - .github/workflows/xhttp-deploy.yml
+permissions:
+  contents: read
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    steps:
+      - name: Deploy loopback XHTTP and add one nginx location with rollback
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: ${{ secrets.SERVER_USER }}
+          key: ${{ secrets.SERVER_SSH_KEY }}
+          port: ${{ secrets.SERVER_PORT || 22 }}
+          timeout: 40s
+          command_timeout: 250s
+          script_stop: true
+          script: |
+            set -Eeuo pipefail
+            umask 077
+            stage=init
+            ng_backup=''
+            cleanup_on_exit() {
+              rc=$?
+              trap - EXIT
+              if [ "$rc" -ne 0 ]; then
+                echo 'XHTTP validation failed; rolling back newly created XHTTP changes'
+                if [ "$stage" = nginx_modified ] || [ "$stage" = nginx_reloaded ]; then
+                  cp -a "$ng_backup" /etc/nginx/conf.d/cf-ws-backup.conf
+                  nginx -t >/dev/null 2>&1 && systemctl reload nginx || true
+                fi
+                systemctl disable --now myvps-xhttp.service >/dev/null 2>&1 || true
+                rm -f /etc/systemd/system/myvps-xhttp.service
+                systemctl daemon-reload || true
+              fi
+              exit "$rc"
+            }
+            trap cleanup_on_exit EXIT
+            echo '=== XHTTP ISOLATED DEPLOY BEGIN ==='
+            test "$(systemctl is-active nginx)" = active
+            test "$(systemctl is-active xray-racknerd-443)" = active
+            test "$(systemctl is-active xray-racknerd-cf-ws)" = active
+            test ! -e /etc/systemd/system/myvps-xhttp.service
+            test ! -e /etc/myvps/xhttp/config.json
+            ! ss -H -lnt | awk '{print $4}' | grep -Eq ':18081$'
+            test -f /etc/nginx/conf.d/cf-ws-backup.conf
+            install -d -m 700 /etc/myvps/xhttp /etc/myvps/xhttp/backups
+            python3 - <<'PYGEN'
+            import copy,json,os,pathlib,secrets,uuid
+            root=pathlib.Path('/etc/myvps/xhttp')
+            base=json.loads(pathlib.Path('/etc/xray-racknerd-443/config.json').read_text())
+            socks=[o for o in base.get('outbounds',[]) if o.get('protocol')=='socks']
+            assert len(socks)==1 and socks[0].get('tag'), 'Expected one existing SOCKS outbound'
+            tag=socks[0]['tag']
+            assert any(r.get('outboundTag')==tag for r in base.get('routing',{}).get('rules',[]))
+            path='/'+secrets.token_hex(16)
+            uid=str(uuid.uuid4())
+            config={'log':{'loglevel':'warning'},'inbounds':[{'tag':'xhttp-cf','listen':'127.0.0.1','port':18081,'protocol':'vless','settings':{'clients':[{'id':uid}],'decryption':'none'},'streamSettings':{'network':'xhttp','security':'none','xhttpSettings':{'path':path,'mode':'packet-up'}}}],'outbounds':copy.deepcopy(base['outbounds']),'routing':copy.deepcopy(base['routing'])}
+            def write(name,obj):
+             p=root/name
+             with p.open('x') as f: json.dump(obj,f,indent=2)
+             os.chmod(p,0o600)
+            write('config.json',config)
+            def client(host,port,insecure):
+             return {'log':{'loglevel':'warning'},'inbounds':[{'listen':'127.0.0.1','port':18082,'protocol':'socks','settings':{'auth':'noauth','udp':False}}],'outbounds':[{'protocol':'vless','settings':{'vnext':[{'address':host,'port':port,'users':[{'id':uid,'encryption':'none'}]}]},'streamSettings':{'network':'xhttp','security':'tls','tlsSettings':{'serverName':'cf.gooffu.tech','allowInsecure':insecure,'alpn':['h2']},'xhttpSettings':{'path':path,'host':'cf.gooffu.tech','mode':'packet-up'}}}]}
+            write('client-origin.json',client('127.0.0.1',10443,True))
+            write('client-cdn.json',client('cf.gooffu.tech',443,False))
+            write('client-info.json',{'domain':'cf.gooffu.tech','port':443,'transport':'xhttp','mode':'packet-up','security':'tls','uuid':uid,'path':path,'host':'cf.gooffu.tech','serverName':'cf.gooffu.tech','alpn':'h2','outbound':'SOCKS5 existing chain'})
+            print('xhttp_secret_config_generated=yes')
+            PYGEN
+            /usr/local/bin/xray run -test -config /etc/myvps/xhttp/config.json >/dev/null 2>&1
+            echo 'xray_xhttp_config_syntax=PASS'
+            cat > /etc/systemd/system/myvps-xhttp.service <<'UNIT'
+            [Unit]
+            Description=MyVPS isolated CF XHTTP VLESS endpoint
+            Wants=network-online.target
+            After=network-online.target
+            [Service]
+            Type=simple
+            ExecStart=/usr/local/bin/xray run -config /etc/myvps/xhttp/config.json
+            Restart=on-failure
+            RestartSec=3
+            LimitNOFILE=16384
+            NoNewPrivileges=true
+            PrivateTmp=true
+            [Install]
+            WantedBy=multi-user.target
+            UNIT
+            chmod 644 /etc/systemd/system/myvps-xhttp.service
+            systemctl daemon-reload
+            systemctl enable --now myvps-xhttp.service >/dev/null
+            sleep 1
+            test "$(systemctl is-active myvps-xhttp.service)" = active
+            ss -H -lnt | awk '{print $4}' | grep -Eq ':18081$'
+            echo 'xhttp_local_service=PASS'
+            ng_backup=/etc/myvps/xhttp/backups/cf-ws-backup.before-xhttp.conf
+            cp -a /etc/nginx/conf.d/cf-ws-backup.conf "$ng_backup"
+            python3 - <<'PYNG'
+            import pathlib,json,re
+            conf=pathlib.Path('/etc/nginx/conf.d/cf-ws-backup.conf')
+            s=conf.read_text()
+            path=json.loads(pathlib.Path('/etc/myvps/xhttp/client-info.json').read_text())['path']
+            assert 'server_name cf.gooffu.tech;' in s, 'Unexpected nginx CF server'
+            assert s.count('server {')==1, 'Do not patch multi-server file'
+            assert 'grpc_pass grpc://127.0.0.1:18081' not in s
+            assert s.rstrip().endswith('}'), 'Server block format unexpected'
+            assert path not in s
+            entry='\n    # Added by MyVPS isolated XHTTP; preserve existing WS routes.\n    location ^~ '+path+' {\n        client_max_body_size 0;\n        client_body_timeout 1h;\n        grpc_read_timeout 1h;\n        grpc_send_timeout 1h;\n        grpc_pass grpc://127.0.0.1:18081;\n    }\n'
+            i=s.rfind('}')
+            conf.write_text(s[:i]+entry+s[i:])
+            print('nginx_added_dedicated_xhttp_location=yes')
+            PYNG
+            stage=nginx_modified
+            nginx -t >/dev/null 2>&1
+            echo 'nginx_xhttp_syntax=PASS'
+            systemctl reload nginx
+            stage=nginx_reloaded
+            sleep 1
+            test "$(systemctl is-active nginx)" = active
+            test "$(systemctl is-active xray-racknerd-443)" = active
+            test "$(systemctl is-active xray-racknerd-cf-ws)" = active
+            curl --noproxy '*' -k -fSs --connect-timeout 6 --max-time 12 --resolve cf.gooffu.tech:443:127.0.0.1 -o /dev/null https://cf.gooffu.tech/
+            echo 'existing_cf_web_route=PASS'
+            echo '=== ISOLATED XHTTP INSTALLED ==='
+            echo 'server_local_port=18081; client_info_file=/etc/myvps/xhttp/client-info.json'
+            echo 'NO UUID, PATH, PASSWORD OR PRIVATE KEY PRINTED'
+            trap - EXIT
