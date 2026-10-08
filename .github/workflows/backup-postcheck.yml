@@ -1,0 +1,58 @@
+name: Temporary post-deploy backup verification
+on:
+  push:
+    branches:
+      - ops/read-only-vps-audit-20261008
+    paths:
+      - .github/workflows/backup-postcheck.yml
+permissions:
+  contents: read
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 4
+    steps:
+      - name: Confirm daily timers and cloud object metadata
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: ${{ secrets.SERVER_USER }}
+          key: ${{ secrets.SERVER_SSH_KEY }}
+          port: ${{ secrets.SERVER_PORT || 22 }}
+          timeout: 35s
+          command_timeout: 150s
+          script_stop: false
+          script: |
+            set +e
+            export LC_ALL=C
+            echo '=== BACKUP POST DEPLOY HEALTH ==='
+            printf 'config_timer='; systemctl is-active myvps-backup-config.timer
+            printf 'blog_timer='; systemctl is-active myvps-backup-blog.timer
+            printf 'config_enabled='; systemctl is-enabled myvps-backup-config.timer
+            printf 'blog_enabled='; systemctl is-enabled myvps-backup-blog.timer
+            printf 'config_next_utc='; systemctl show myvps-backup-config.timer -p NextElapseUSecRealtime --value
+            printf 'blog_next_utc='; systemctl show myvps-backup-blog.timer -p NextElapseUSecRealtime --value
+            printf 'config_service_result='; systemctl show myvps-backup-config.service -p Result --value
+            printf 'blog_service_result='; systemctl show myvps-backup-blog.service -p Result --value
+            printf 'key_permissions='; stat -c '%a' /etc/myvps/backup.pass
+            printf 'key_size_nonzero='; test -s /etc/myvps/backup.pass && echo yes || echo no
+            printf 'backup_companion_syntax='; bash -n /opt/myvps/backup/myvps_backup.sh && echo PASS || echo FAIL
+            echo '=== CLOUD NEW OBJECT METADATA ==='
+            python3 - <<'PY'
+            import subprocess,json,datetime
+            try:
+             r=open('/etc/myvps/backup.remote').read().strip()
+             p=subprocess.run(['rclone','lsjson','--files-only',r+'VPS-Backups'],capture_output=True,text=True,timeout=35)
+             d=json.loads(p.stdout) if p.returncode==0 else []
+             for k in ('config','blog'):
+              files=[v for v in d if v.get('Name','').startswith('myvps-'+k+'-') and v.get('Name','').endswith('.gpg')]
+              print('cloud_'+k+'_count='+str(len(files)))
+              if files:
+               newest=max(files,key=lambda v:v.get('ModTime',''))
+               print('cloud_'+k+'_latest_utc='+newest.get('ModTime',''))
+               print('cloud_'+k+'_bytes='+str(newest.get('Size',0)))
+            except Exception as e:print('cloud_metadata_status='+type(e).__name__)
+            PY
+            echo '=== UNCHANGED PROXY SERVICES ==='
+            for s in nginx xray-racknerd-443 fail2ban; do echo "$s=$(systemctl is-active "$s" 2>/dev/null)"; done
+            echo '=== AUDIT COMPLETE ==='
