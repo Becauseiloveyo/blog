@@ -1,4 +1,4 @@
-name: Temporary XHTTP REALITY sanitized failed-connection diagnostics
+name: Temporary direct XHTTP REALITY debug
 on:
   push:
     branches:
@@ -8,11 +8,11 @@ on:
 permissions:
   contents: read
 jobs:
-  inspect:
+  debug:
     runs-on: ubuntu-latest
     timeout-minutes: 4
     steps:
-      - name: Inspect sanitized client and service error logs
+      - name: Try localhost REALITY XHTTP without nginx and redact debug logs
         uses: appleboy/ssh-action@v1.0.3
         with:
           host: ${{ secrets.SERVER_HOST }}
@@ -20,37 +20,45 @@ jobs:
           key: ${{ secrets.SERVER_SSH_KEY }}
           port: ${{ secrets.SERVER_PORT || 22 }}
           timeout: 35s
-          command_timeout: 140s
+          command_timeout: 150s
           script_stop: false
           script: |
             set +e
-            echo '=== XHTTP REALITY FAILURE DIAGNOSTICS (SANITIZED) ==='
-            python3 - <<'PY'
-            import pathlib,json,subprocess,re
-            root=pathlib.Path('/etc/myvps/xhttp-reality')
-            if not (root/'config.json').exists():print('new_config_present=no');raise SystemExit
-            cfg=json.loads((root/'config.json').read_text())
-            info=json.loads((root/'client-domain.json').read_text())
-            sec=[cfg['inbounds'][0]['settings']['clients'][0]['id'],cfg['inbounds'][0]['streamSettings']['xhttpSettings']['path'],cfg['inbounds'][0]['streamSettings']['realitySettings']['privateKey']]
-            p=subprocess.run(['journalctl','-u','myvps-xhttp-reality.service','--since','20 minutes ago','-o','cat','--no-pager'],capture_output=True,text=True,timeout=10)
-            items=p.stdout.splitlines()[-50:]
-            for x in items:
-             for v in sec:
-              if v:x=x.replace(v,'[redacted]')
-             x=re.sub(r'((?:\d{1,3}\.){3}\d{1,3})(?::\d+)?','[ip]',x)
-             if any(k in x.lower() for k in ('error','fail','warn','listen','start','tls','reality','xhttp','close','h2','mux')):print('server_log='+x[:200])
-            logs=sorted(pathlib.Path('/var/tmp').glob('myvps-xhttp-reality-probe.*/client.log'))
-            print('saved_client_logs='+str(len(logs)))
-            for f in logs[-2:]:
-             try:lines=f.read_text(errors='replace').splitlines()[-40:]
-             except OSError:continue
-             for line in lines:
-              for v in sec:
-               if v:line=line.replace(v,'[redacted]')
-              line=re.sub(r'((?:\d{1,3}\.){3}\d{1,3})(?::\d+)?','[ip]',line)
-              if any(k in line.lower() for k in ('error','fail','warn','tls','reality','xhttp','close','mux','fingerprint')):print('client_log='+line[:220])
+            echo '=== DIRECT LOCALHOST XHTTP REALITY REPRO ==='
+            dir=$(mktemp -d /var/tmp/myvps-reality-direct.XXXXXXXX)
+            spid=''; cpid=''
+            cleanup() { test -z "$cpid" || { kill "$cpid" 2>/dev/null; wait "$cpid" 2>/dev/null; }; test -z "$spid" || { kill "$spid" 2>/dev/null; wait "$spid" 2>/dev/null; }; rm -rf "$dir"; }
+            trap cleanup EXIT
+            python3 - "$dir" <<'PY'
+            import json,pathlib,sys
+            d=pathlib.Path(sys.argv[1]); root=pathlib.Path('/etc/myvps/xhttp-reality')
+            for f in ('config.json','client-test.json'):
+             obj=json.loads((root/f).read_text())
+             obj['log']['loglevel']='debug'
+             if f=='client-test.json':obj['outbounds'][0]['settings']['vnext'][0]['port']=24444
+             (d/f).write_text(json.dumps(obj))
             PY
-            printf 'new_service_state='; systemctl is-active myvps-xhttp-reality.service || true
-            printf 'nginx_syntax='; nginx -t >/dev/null 2>&1 && echo PASS || echo FAIL
-            printf 'old_reality_state='; systemctl is-active xray-racknerd-443.service
-            echo '=== END ==='
+            /usr/local/bin/xray run -config "$dir/config.json" >"$dir/server.log" 2>&1 &
+            spid=$!
+            sleep 1
+            if ! kill -0 "$spid" 2>/dev/null; then echo 'debug_server_start=FAIL';exit 1;fi
+            /usr/local/bin/xray run -config "$dir/client-test.json" >"$dir/client.log" 2>&1 &
+            cpid=$!
+            sleep 1
+            if ! kill -0 "$cpid" 2>/dev/null;then echo 'debug_client_start=FAIL';exit 1;fi
+            result=$(curl -sS -4 --socks5-hostname 127.0.0.1:18084 --connect-timeout 8 --max-time 18 -o "$dir/response" -w 'http=%{http_code} err=%{errormsg}' https://www.cloudflare.com/cdn-cgi/trace 2>&1)
+            rc=$?
+            echo "direct_connect_result=$result curl_exit=$rc"
+            python3 - "$dir" <<'PY'
+            import pathlib,json,sys,re
+            d=pathlib.Path(sys.argv[1]);base=pathlib.Path('/etc/myvps/xhttp-reality');cfg=json.loads((base/'config.json').read_text());cc=json.loads((base/'client-domain.json').read_text())
+            secret=[cfg['inbounds'][0]['settings']['clients'][0]['id'],cfg['inbounds'][0]['streamSettings']['xhttpSettings']['path'],cfg['inbounds'][0]['streamSettings']['realitySettings']['privateKey'],cc['outbounds'][0]['streamSettings']['realitySettings']['password']]
+            for name in ('server','client'):
+             print('=== '+name+' error-relevant logs ===')
+             for x in (d/(name+'.log')).read_text(errors='replace').splitlines()[-45:]:
+              for v in secret:
+               if v:x=x.replace(v,'[redacted]')
+              x=re.sub(r'\b(?:\d{1,3}\.){3}\d{1,3}\b','[ip]',x)
+              if any(w in x.lower() for w in ('error','fail','handshake','reality','tls','xhttp','not support','warning')):print(name+'_log='+x[:240])
+            PY
+            echo '=== FINISH ==='
