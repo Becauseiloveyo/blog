@@ -1,0 +1,55 @@
+name: Temporary XHTTP local/CDN client test
+on:
+  push:
+    branches:
+      - ops/read-only-vps-audit-20261008
+    paths:
+      - .github/workflows/xhttp-test.yml
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Xray client true HTTP test through XHTTP proxy
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: ${{ secrets.SERVER_USER }}
+          key: ${{ secrets.SERVER_SSH_KEY }}
+          port: ${{ secrets.SERVER_PORT || 22 }}
+          timeout: 40s
+          command_timeout: 190s
+          script_stop: false
+          script: |
+            set -Eeuo pipefail
+            umask 077
+            echo '=== XHTTP REAL CONNECTION CHECK ==='
+            systemctl is-active --quiet myvps-xhttp.service
+            systemctl is-active --quiet nginx
+            systemctl is-active --quiet xray-racknerd-443
+            systemctl is-active --quiet xray-racknerd-cf-ws
+            tempdir=$(mktemp -d /var/tmp/myvps-xhttp-test.XXXXXXXX)
+            child=''
+            cleanup() { if [ -n "$child" ]; then kill "$child" 2>/dev/null || true; wait "$child" 2>/dev/null || true; fi; rm -rf "$tempdir"; }
+            trap cleanup EXIT
+            for mode in origin cdn; do
+              /usr/local/bin/xray run -config "/etc/myvps/xhttp/client-$mode.json" > "$tempdir/xray-$mode.log" 2>&1 &
+              child=$!
+              sleep 2
+              if ! kill -0 "$child" 2>/dev/null; then echo "xhttp_$mode=CLIENT_START_FAILURE"; exit 1; fi
+              result=$(curl -sS -4 --socks5-hostname 127.0.0.1:18082 --connect-timeout 10 --max-time 30 -o "$tempdir/$mode.response" -w '%{http_code}' https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null || true)
+              if [ "$result" = 200 ] && grep -q '^ip=' "$tempdir/$mode.response"; then
+                echo "xhttp_$mode=PASS (HTTPS 200 via XHTTP and SOCKS chain)"
+              else
+                echo "xhttp_$mode=FAIL status=${result:-no-response}"
+                if [ "$mode" = origin ]; then exit 1; fi
+              fi
+              kill "$child" 2>/dev/null || true
+              wait "$child" 2>/dev/null || true
+              child=''
+            done
+            echo '=== EXISTING SERVICES AND ROUTES ==='
+            for s in nginx xray-racknerd-443 xray-racknerd-cf-ws myvps-xhttp; do echo "$s=$(systemctl is-active "$s")"; done
+            echo '=== TEST COMPLETE ==='
