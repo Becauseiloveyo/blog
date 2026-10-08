@@ -1,4 +1,4 @@
-name: Temporary nginx route shape inspection
+name: Temporary final post-XHTTP safety check
 on:
   push:
     branches:
@@ -8,11 +8,11 @@ on:
 permissions:
   contents: read
 jobs:
-  inspect:
+  check:
     runs-on: ubuntu-latest
     timeout-minutes: 4
     steps:
-      - name: Inspect CF server block shape without paths or keys
+      - name: Verify localhost-only XHTTP and old services
         uses: appleboy/ssh-action@v1.0.3
         with:
           host: ${{ secrets.SERVER_HOST }}
@@ -24,30 +24,17 @@ jobs:
           script_stop: false
           script: |
             set +e
-            echo '=== NGINX FILES CONTAINING CF HOST ==='
-            python3 - <<'PY'
-            from pathlib import Path
-            import re
-            for p in Path('/etc/nginx').rglob('*'):
-             if not p.is_file() or p.is_symlink(): continue
-             try:s=p.read_text(errors='replace')
-             except (OSError,UnicodeError):continue
-             if 'cf.gooffu.tech' not in s: continue
-             print('config_file='+str(p))
-             for line in s.splitlines():
-              l=line.strip()
-              if re.search(r'^\s*(server|http|stream)\s*\{',l): print('  '+l)
-              elif l.startswith('listen '): print('  '+l)
-              elif l.startswith('server_name '): print('  '+l)
-              elif l.startswith('location '):print('  location=<existing>')
-              elif l.startswith('proxy_pass ') or l.startswith('grpc_pass '):
-               print('  '+re.sub(r'(?:127\.0\.0\.1|localhost):\d+', '127.0.0.1:<port>',l))
-              elif l.startswith('include '):print('  '+l)
-            PY
-            echo '=== STREAM CONNECTIONS AND CF SERVICES ==='
-            for x in xray-racknerd-cf-ws nginx xray-racknerd-443; do echo "$x=$(systemctl is-active "$x" 2>/dev/null)"; done
-            printf 'cf_xray_service_command='; systemctl show xray-racknerd-cf-ws -p ExecStart --value 2>/dev/null | sed -E 's/config[^ ]*\.json/config.json/g;s#/[a-zA-Z0-9._/-]+\.json#<json>#g' | cut -c 1-140
-            echo
-            echo '=== CERT DOMAIN SCOPE ==='
-            for f in /etc/nginx/sites-enabled/* /etc/nginx/conf.d/*; do [ -f "$f" ] || continue; if grep -q 'cf.gooffu.tech' "$f"; then printf 'candidate=%s ' "$f"; wc -l < "$f"; fi; done
-            echo '=== DONE ==='
+            echo '=== POST XHTTP READ ONLY CHECK ==='
+            printf 'memory='; free -m | awk '/^Mem:/ {printf "total=%s used=%s available=%s\n",$2,$3,$7}'
+            printf 'disk='; df -h / | awk 'NR==2{printf "used=%s free=%s pct=%s\n",$3,$4,$5}'
+            printf 'xhttp_bind_loopback='; ss -H -lnt | awk '{print $4}' | grep -Eq '^127\.0\.0\.1:18081$' && echo PASS || echo FAIL
+            printf 'xray_xhttp_config='; /usr/local/bin/xray run -test -config /etc/myvps/xhttp/config.json >/dev/null 2>&1 && echo PASS || echo FAIL
+            printf 'nginx_syntax='; nginx -t >/dev/null 2>&1 && echo PASS || echo FAIL
+            printf 'backup_watch_timer='; systemctl is-enabled myvps-backup-watch.timer
+            printf 'backup_watch_active='; systemctl is-active myvps-backup-watch.timer
+            for host in cf.gooffu.tech blog.gooffu.tech; do
+             out=$(curl --noproxy '*' --connect-timeout 6 --max-time 10 --resolve "$host:443:127.0.0.1" -ksS -o /dev/null -w '%{http_code}' "https://$host/" 2>/dev/null)
+             echo "local_https_$host=$out"
+            done
+            for s in nginx xray-racknerd-443 xray-racknerd-cf-ws myvps-xhttp fail2ban; do echo "service_$s=$(systemctl is-active "$s")"; done
+            echo '=== CHECK COMPLETE ==='
