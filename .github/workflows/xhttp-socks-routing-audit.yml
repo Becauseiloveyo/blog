@@ -1,0 +1,48 @@
+name: Temporary XHTTP chain routing verification
+on:
+  push:
+    branches:
+      - ops/read-only-vps-audit-20261008
+    paths:
+      - .github/workflows/xhttp-socks-routing-audit.yml
+permissions:
+  contents: read
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 4
+    steps:
+      - name: Classify Xray outbound rules without reading credentials into logs
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: ${{ secrets.SERVER_USER }}
+          key: ${{ secrets.SERVER_SSH_KEY }}
+          port: ${{ secrets.SERVER_PORT || 22 }}
+          timeout: 35s
+          command_timeout: 120s
+          script_stop: false
+          script: |
+            set +e
+            umask 077
+            echo '=== XHTTP REALITY OUTBOUND ROUTING CLASSIFICATION ==='
+            python3 - <<'PY'
+            from pathlib import Path
+            import json
+            paths={'legacy_reality':Path('/etc/xray-racknerd-443/config.json'),'xhttp_reality':Path('/etc/myvps/xhttp-reality/config.json'),'cdn_xhttp':Path('/etc/myvps/xhttp/config.json')}
+            for label,path in paths.items():
+             try:cfg=json.loads(path.read_text())
+             except Exception:print(label+'_config=UNREADABLE');continue
+             out=cfg.get('outbounds',[]);tags={o.get('tag') for o in out if o.get('protocol')=='socks'}
+             inbound=[i.get('tag','') for i in cfg.get('inbounds',[])]
+             print(label+'_socks_outbounds='+str(len(tags)))
+             print(label+'_first_outbound_protocol='+str(out[0].get('protocol') if out else 'none'))
+             print(label+'_rule_count='+str(len(cfg.get('routing',{}).get('rules',[]))))
+             for idx,r in enumerate(cfg.get('routing',{}).get('rules',[]),1):
+              matches=[k for k in ('domain','ip','port','sourcePort','inboundTag','network','protocol','user','attrs','source','balancerTag') if k in r]
+              print(label+'_rule_'+str(idx)+'_targets_socks='+str(r.get('outboundTag') in tags))
+              print(label+'_rule_'+str(idx)+'_matcher_types='+','.join(matches))
+              print(label+'_rule_'+str(idx)+'_type='+str(r.get('type')))
+             print(label+'_outbound_socks_server_counts='+','.join(str(len(o.get('settings',{}).get('servers',[]))) for o in out if o.get('protocol')=='socks'))
+            PY
+            echo '=== END READ-ONLY CLASSIFICATION ==='
