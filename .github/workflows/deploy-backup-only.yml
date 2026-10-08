@@ -34,7 +34,7 @@ jobs:
             trap 'rm -f "$file"' EXIT
             curl -fLsS --retry 3 --connect-timeout 10 --max-time 50 -o "$file" "https://raw.githubusercontent.com/Becauseiloveyo/racknerd-v2ray-agent-manager/0f38b0e669d7ae082670d4ad7d2c3d6b0231ab10/myvps_backup.sh"
             bash -n "$file"
-            grep -q '^# Dedicated encrypted backup companion' "$file"
+            grep -q '^# Encrypted cloud backups' "$file"
             if [ -f /opt/myvps/backup/myvps_backup.sh ]; then
              cp -a /opt/myvps/backup/myvps_backup.sh /opt/myvps/backup/myvps_backup.sh.previous
             fi
