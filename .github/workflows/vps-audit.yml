@@ -1,0 +1,103 @@
+name: Read-only VPS health audit
+on:
+  push:
+    branches:
+      - ops/read-only-vps-audit-20261008
+    paths:
+      - .github/workflows/vps-audit.yml
+permissions:
+  contents: read
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Sanitized read-only SSH diagnostics
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: ${{ secrets.SERVER_USER }}
+          key: ${{ secrets.SERVER_SSH_KEY }}
+          port: ${{ secrets.SERVER_PORT || 22 }}
+          timeout: 45s
+          command_timeout: 2m
+          script: |
+            set -u
+            export LC_ALL=C
+            echo '=== VPS read-only audit ==='
+            printf 'UTC: '; date -u '+%Y-%m-%d %H:%M:%S'
+            printf 'OS: '; ( . /etc/os-release && printf '%s\n' "$PRETTY_NAME" ) 2>/dev/null || echo unknown
+            printf 'Kernel: '; uname -r
+            printf 'Uptime: '; uptime -p 2>/dev/null || true
+            printf 'CPU logical cores: '; nproc 2>/dev/null || true
+            printf 'Memory: '; free -h | awk '/^Mem:/ {print "total=" $2, "used=" $3, "available=" $7}'
+            printf 'Disk /: '; df -h / | awk 'NR==2 {print "size=" $2, "used=" $3, "available=" $4, "usage=" $5}'
+            echo '--- Service states ---'
+            for svc in nginx xray xray-racknerd-443 xray-racknerd-cf myvps-xray pm2-root AdGuardHome adguardhome fail2ban; do
+              if systemctl list-unit-files "$svc.service" --no-legend 2>/dev/null | grep -q .; then
+                printf '%s: %s\n' "$svc" "$(systemctl is-active "$svc" 2>/dev/null || echo unknown)"
+              else
+                printf '%s: no-unit\n' "$svc"
+              fi
+            done
+            echo '--- TCP listeners (without bind addresses) ---'
+            if command -v ss >/dev/null 2>&1; then
+              for port in 22 80 443 3000 15593 15594; do
+                if ss -H -lnt | awk '{print $4}' | grep -Eq ":$port$"; then
+                  printf 'TCP %s: LISTEN\n' "$port"
+                else
+                  printf 'TCP %s: CLOSED\n' "$port"
+                fi
+              done
+            fi
+            echo '--- Config checks (no raw config printed) ---'
+            if command -v nginx >/dev/null 2>&1; then
+              if nginx -t >/dev/null 2>&1; then echo 'nginx syntax: PASS'; else echo 'nginx syntax: FAIL'; fi
+            fi
+            xraybin=''
+            for f in /usr/local/bin/xray /usr/bin/xray /opt/myvps/xray/xray; do
+              if [ -x "$f" ]; then xraybin="$f"; break; fi
+            done
+            if [ -n "$xraybin" ]; then
+              printf 'Xray version: '; "$xraybin" version 2>/dev/null | head -n1 || true
+            else
+              echo 'Xray: binary not found at common paths'
+            fi
+            for config in /etc/xray-racknerd-443/config.json /usr/local/etc/xray/config.json /etc/myvps/xray/config.json; do
+              if [ -f "$config" ]; then
+                case "$config" in
+                  /etc/xray-racknerd-443/*) kind=legacy-reality ;;
+                  /usr/local/etc/xray/*) kind=system-xray ;;
+                  *) kind=owned-xray ;;
+                esac
+                if [ -n "$xraybin" ]; then
+                  if "$xraybin" run -test -config "$config" >/dev/null 2>&1; then
+                    echo "$kind config: PASS"
+                  else
+                    echo "$kind config: FAIL (check core compatibility)"
+                  fi
+                fi
+                if command -v jq >/dev/null 2>&1; then
+                  jq -r --arg name "$kind" '
+                    $name + " inbound protocols: " +
+                    ([.inbounds[]?.protocol] | group_by(.) | map(.[0] + "=" + (length|tostring)) | join(", ")),
+                    $name + " outbound protocols: " +
+                    ([.outbounds[]?.protocol] | group_by(.) | map(.[0] + "=" + (length|tostring)) | join(", ")),
+                    $name + " routing rules: " + ((.routing.rules // [] | length) | tostring)
+                  ' "$config" 2>/dev/null || echo "$kind: unable to summarize protocols"
+                fi
+              fi
+            done
+            echo '--- Backup tools ---'
+            for tool in rclone gpg tar; do
+              if command -v "$tool" >/dev/null 2>&1; then echo "$tool: installed"; else echo "$tool: missing"; fi
+            done
+            echo '--- VPS egress IPv4 HTTPS ---'
+            if command -v curl >/dev/null 2>&1; then
+              if curl -4 -fsS -o /dev/null --connect-timeout 5 --max-time 10 https://www.cloudflare.com/; then
+                echo 'Cloudflare HTTPS: OK'
+              else
+                echo 'Cloudflare HTTPS: FAIL'
+              fi
+            fi
+            echo '=== Audit finished: no changes ==='
