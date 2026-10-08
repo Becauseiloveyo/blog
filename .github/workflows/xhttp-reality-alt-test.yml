@@ -1,0 +1,59 @@
+name: XHTTP REALITY alternate target diagnostic
+on:
+  push:
+    branches:
+      - ops/read-only-vps-audit-20261008
+    paths:
+      - .github/workflows/xhttp-reality-alt-test.yml
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 4
+    steps:
+      - name: Compare REALITY XHTTP against different fallback without modifying production
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: ${{ secrets.SERVER_USER }}
+          key: ${{ secrets.SERVER_SSH_KEY }}
+          port: ${{ secrets.SERVER_PORT || 22 }}
+          timeout: 40s
+          command_timeout: 170s
+          script_stop: false
+          script: |
+            set +e
+            echo '=== ALT REALITY TARGET DIRECT TEST ==='
+            work=$(mktemp -d /var/tmp/myvps-reality-alt.XXXXXXXX)
+            server=''; client=''
+            cleanup() { [ -z "$client" ] || { kill "$client" 2>/dev/null; wait "$client" 2>/dev/null; }; [ -z "$server" ] || { kill "$server" 2>/dev/null; wait "$server" 2>/dev/null; }; rm -rf -- "$work"; }
+            trap cleanup EXIT
+            python3 - "$work" <<'PY'
+            import json,pathlib,subprocess,sys
+            d=pathlib.Path(sys.argv[1]); root=pathlib.Path('/etc/myvps/xhttp-reality')
+            a=json.loads((root/'config.json').read_text());b=json.loads((root/'client-test.json').read_text())
+            a['inbounds'][0]['streamSettings']['realitySettings']['serverNames']=['www.cloudflare.com']
+            a['inbounds'][0]['streamSettings']['realitySettings']['target']='www.cloudflare.com:443'
+            b['outbounds'][0]['settings']['vnext'][0]['port']=24444
+            b['outbounds'][0]['streamSettings']['realitySettings']['serverName']='www.cloudflare.com'
+            for n,content in (('s.json',a),('c.json',b)):(d/n).write_text(json.dumps(content))
+            secret=a['inbounds'][0]['streamSettings']['realitySettings']['privateKey']
+            p=subprocess.run(['/usr/local/bin/xray','x25519','-i',secret],capture_output=True,text=True)
+            clientkey=b['outbounds'][0]['streamSettings']['realitySettings']['password']
+            matches=clientkey in p.stdout if p.returncode==0 else False
+            print('x25519_derived_public_matches_client='+str(matches))
+            PY
+            /usr/local/bin/xray run -test -config "$work/s.json" >/dev/null 2>&1
+            /usr/local/bin/xray run -test -config "$work/c.json" >/dev/null 2>&1
+            /usr/local/bin/xray run -config "$work/s.json" > "$work/server.log" 2>&1 &
+            server=$!
+            sleep 1
+            /usr/local/bin/xray run -config "$work/c.json" > "$work/client.log" 2>&1 &
+            client=$!
+            sleep 1
+            result=$(curl -sS -4 --socks5-hostname 127.0.0.1:18084 --connect-timeout 10 --max-time 25 -o "$work/content" -w '%{http_code} %{errormsg}' https://www.cloudflare.com/cdn-cgi/trace 2>&1)
+            rc=$?
+            echo "alternate_sni_direct_test=$result curl_exit=$rc"
+            if [ "$rc" = 0 ] && grep -q '^ip=' "$work/content"; then echo 'alternate_sni_tls_end_to_end=PASS'; else echo 'alternate_sni_tls_end_to_end=FAIL'; fi
+            echo '=== TARGET TEST COMPLETE ==='
