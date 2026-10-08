@@ -32,7 +32,7 @@ jobs:
             mkdir -p /opt/myvps/backup
             file=$(mktemp /var/tmp/myvps-new-backup.XXXXXXXX)
             trap 'rm -f "$file"' EXIT
-            curl -fLsS --retry 3 --connect-timeout 10 --max-time 50 -o "$file" "https://raw.githubusercontent.com/Becauseiloveyo/racknerd-v2ray-agent-manager/0f38b0e669d7ae082670d4ad7d2c3d6b0231ab10/myvps_backup.sh"
+            curl -fLsS --retry 3 --connect-timeout 10 --max-time 50 -o "$file" "https://raw.githubusercontent.com/Becauseiloveyo/racknerd-v2ray-agent-manager/8d04c40211a3fdbd70a4753bd71e827f42397fd6/myvps_backup.sh"
             bash -n "$file"
             grep -q '^# Encrypted cloud backups' "$file"
             if [ -f /opt/myvps/backup/myvps_backup.sh ]; then
