@@ -1,0 +1,71 @@
+name: Temporary VPS broad read-only audit
+on:
+  push:
+    branches:
+      - ops/read-only-vps-audit-20261008
+    paths:
+      - .github/workflows/health-check.yml
+permissions:
+  contents: read
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Read sanitized VPS health data over existing SSH
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: ${{ secrets.SERVER_USER }}
+          key: ${{ secrets.SERVER_SSH_KEY }}
+          port: ${{ secrets.SERVER_PORT || 22 }}
+          timeout: 35s
+          command_timeout: 180s
+          script_stop: false
+          script: |
+            set +e
+            export LC_ALL=C
+            echo '=== SERVER RESOURCE ==='
+            . /etc/os-release; echo "os=$PRETTY_NAME"
+            printf 'time='; date -u '+%FT%TZ'
+            printf 'uptime='; uptime -p
+            printf 'cpu='; nproc
+            free -m | awk '/^Mem:/{print "mem_total_mb=" $2 " mem_available_mb=" $7} /^Swap:/{print "swap_total_mb=" $2 " swap_used_mb=" $3}'
+            df -h / | awk 'NR==2{print "root_size=" $2 " used=" $3 " free=" $4 " utilization=" $5}'
+            printf 'failed_units='; systemctl --failed --plain --no-legend 2>/dev/null | awk 'NF{n++} END{print n+0}'
+            echo '=== SERVICES ==='
+            for s in ssh nginx xray xray-racknerd-443 myvps-xray fail2ban cron docker wg-quick@warp warp-svc cloudflared AdGuardHome adguardhome; do printf '%s=%s\n' "$s" "$(systemctl is-active "$s" 2>/dev/null)"; done
+            echo '=== LISTENERS ==='
+            for p in 22 80 443 3000 8443 2053 15593 15594 1080 10808; do n=$(ss -H -lnt 2>/dev/null | awk '{print $4}' | grep -Ec ":$p$" || true); echo "tcp_$p=$n"; done
+            echo '=== XRAY ==='
+            for b in /usr/local/bin/xray /usr/bin/xray /opt/myvps/xray/xray; do if [ -x "$b" ]; then printf 'xray_version='; "$b" version 2>/dev/null | head -1; break; fi; done
+            if command -v nginx >/dev/null 2>&1; then nginx -t >/dev/null 2>&1 && echo nginx_syntax=PASS || echo nginx_syntax=FAIL; fi
+            for c in /etc/xray-racknerd-443/config.json /usr/local/etc/xray/config.json /etc/xray/config.json /etc/myvps/xray/config.json /etc/sing-box/config.json; do
+              if [ -r "$c" ]; then
+                case "$c" in */xray-racknerd-443/*) k=reality;; */myvps/*) k=myvps;; */sing-box/*) k=singbox;; *) k=xray_other;; esac
+                echo "config_${k}=PRESENT"
+                if command -v jq >/dev/null 2>&1; then
+                  jq -r --arg k "$k" '"in_"+$k+"="+([.inbounds[]?|.protocol//.type//"unknown"]|sort|group_by(.)|map(.[0]+":"+(length|tostring))|join(",")),"out_"+$k+"="+([.outbounds[]?|.protocol//.type//"unknown"]|sort|group_by(.)|map(.[0]+":"+(length|tostring))|join(",")),"transport_"+$k+"="+([.inbounds[]?|.streamSettings?.network//.transport?.type//"default"]|sort|group_by(.)|map(.[0]+":"+(length|tostring))|join(",")),"route_"+$k+"="+((.routing.rules//.route.rules//[]|length)|tostring)' "$c" 2>/dev/null || echo "parse_$k=FAIL"
+                fi
+                if [ -n "$b" ]; then "$b" run -test -config "$c" >/dev/null 2>&1 && echo "xray_test_${k}=PASS" || echo "xray_test_${k}=FAIL_OR_DIFFERENT_CORE"; fi
+              fi
+            done
+            echo '=== CHAIN EXIT WARP ==='
+            for f in /root/my_vps_exit_manager.sh /root/my_vps_manager.sh /usr/local/bin/myvps; do if [ -f "$f" ]; then echo "script_$(basename "$f")=present"; else echo "script_$(basename "$f")=absent"; fi; done
+            for cmd in wg wg-quick warp-cli rclone; do command -v "$cmd" >/dev/null 2>&1 && echo "tool_$cmd=yes" || echo "tool_$cmd=no"; done
+            printf 'wg_interface_count='; (command -v wg >/dev/null 2>&1 && wg show interfaces 2>/dev/null || true) | wc -w
+            printf 'warp_or_wg_link_count='; ip -o link show 2>/dev/null | grep -Eic 'warp|wg[0-9]|wireguard' || true
+            printf 'default_route_device='; ip -4 route show default | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1);exit}}'
+            printf 'routing_rule_count='; ip -4 rule show | wc -l
+            echo '=== SSH FIREWALL BACKUPS ==='
+            for k in passwordauthentication permitrootlogin pubkeyauthentication; do v=$(/usr/sbin/sshd -T 2>/dev/null | awk -v k="$k" '$1==k{print $2;exit}'); echo "ssh_$k=$v"; done
+            if command -v ufw >/dev/null 2>&1; then ufw status | head -1 | sed 's/^/ufw=/'; fi
+            if command -v fail2ban-client >/dev/null 2>&1; then fail2ban-client ping >/dev/null 2>&1 && echo fail2ban_api=OK || echo fail2ban_api=FAIL; fi
+            printf 'cron_entries='; (crontab -l 2>/dev/null || true) | awk 'NF && $1 !~ /^#/{n++} END{print n+0}'
+            printf 'cron_backup_refs='; (crontab -l 2>/dev/null || true) | grep -Eic 'backup|rclone' || true
+            for t in myvps-backup-vps.timer myvps-backup-blog.timer certbot.timer; do echo "timer_$t=$(systemctl is-enabled "$t" 2>/dev/null)"; done
+            printf 'rclone_remote_count='; (rclone listremotes 2>/dev/null || true) | wc -l
+            echo '=== BLOG DNS HTTPS ==='
+            if command -v pm2 >/dev/null 2>&1 && command -v jq >/dev/null 2>&1; then pm2 jlist 2>/dev/null | jq -r '.[]|"pm2="+(.name//"unknown")+" status="+(.pm2_env.status//"unknown")' 2>/dev/null; fi
+            for host in blog.gooffu.tech cf.gooffu.tech; do result=$(curl -4 -L -sS --connect-timeout 5 --max-time 12 -o /dev/null -w '%{http_code}|%{ssl_verify_result}' "https://$host" 2>/dev/null); echo "https_$host=$result"; done
+            echo '=== FINISHED ==='
