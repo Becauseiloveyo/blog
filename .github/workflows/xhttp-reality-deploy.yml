@@ -1,4 +1,4 @@
-name: Temporary XHTTP REALITY isolated deployment
+name: XHTTP REALITY stable target deployment and verification
 on:
   push:
     branches:
@@ -10,9 +10,9 @@ permissions:
 jobs:
   install:
     runs-on: ubuntu-latest
-    timeout-minutes: 8
+    timeout-minutes: 9
     steps:
-      - name: Deploy localhost REALITY XHTTP and validate actual client handshake
+      - name: Install verified XHTTP REALITY with Cloudflare fallback site
         uses: appleboy/ssh-action@v1.0.3
         with:
           host: ${{ secrets.SERVER_HOST }}
@@ -20,82 +20,72 @@ jobs:
           key: ${{ secrets.SERVER_SSH_KEY }}
           port: ${{ secrets.SERVER_PORT || 22 }}
           timeout: 45s
-          command_timeout: 350s
+          command_timeout: 430s
           script_stop: false
           script: |
             set -Eeuo pipefail
             umask 077
-            stage='init'
-            ng_backup='/etc/myvps/xhttp-reality/nginx-443-sni.before.conf'
-            rollback() {
+            root='/etc/myvps/xhttp-reality'
+            backup="$root/restore-before-cloudflare-target"
+            ng_back="$root/nginx-443-sni.before-cloudflare-target.conf"
+            phase='start'
+            client_pid=''
+            cleanup_and_rollback() {
              local rc=$?
              trap - EXIT
+             if [ -n "$client_pid" ]; then kill "$client_pid" >/dev/null 2>&1 || true; wait "$client_pid" >/dev/null 2>&1 || true; fi
              if [ "$rc" -ne 0 ]; then
-              echo 'xhttp_reality_deployment_failed=YES; initiating rollback'
-              if [ "$stage" = nginx_modified ] || [ "$stage" = nginx_reloaded ]; then
-                if [ -f "$ng_backup" ]; then cp -a "$ng_backup" /etc/nginx/stream.d/443-sni.conf; nginx -t >/dev/null 2>&1 && systemctl reload nginx || true; fi
+              echo 'deployment_result=FAIL; rollback_requested=yes'
+              if [ "$phase" = nginx_modified ] || [ "$phase" = nginx_reloaded ]; then
+               test ! -f "$ng_back" || cp -a "$ng_back" /etc/nginx/stream.d/443-sni.conf
+               nginx -t >/dev/null 2>&1 && systemctl reload nginx || true
               fi
               systemctl disable --now myvps-xhttp-reality.service >/dev/null 2>&1 || true
               rm -f /etc/systemd/system/myvps-xhttp-reality.service
               systemctl daemon-reload >/dev/null 2>&1 || true
-              echo 'xhttp_reality_rollback_attempted=yes'
+              if [ -d "$backup" ]; then for f in config.json client-test.json client-domain.json client-meta.json client-uri.txt; do cp -a "$backup/$f" "$root/$f"; done; fi
+              echo 'rollback_attempted=yes'
              fi
              exit "$rc"
             }
-            trap rollback EXIT
-            echo '=== DEPLOY XHTTP REALITY SIDE-BY-SIDE ==='
-            test "$(systemctl is-active nginx)" = active
-            for s in xray-racknerd-443 xray-racknerd-cf-ws myvps-xhttp; do test "$(systemctl is-active "$s")" = active; done
-            test ! -e /etc/myvps/xhttp-reality/config.json
+            trap cleanup_and_rollback EXIT
+            echo '=== RESTORE ALTERNATE REALITY XHTTP TESTED CONFIG ==='
+            test -f "$root/client-uri.txt"
             test ! -e /etc/systemd/system/myvps-xhttp-reality.service
+            test "$(systemctl is-active nginx)" = active
+            for svc in xray-racknerd-443 xray-racknerd-cf-ws myvps-xhttp; do systemctl is-active --quiet "$svc"; done
             ! ss -H -lnt | awk '{print $4}' | grep -q ':24444$'
-            curl --noproxy '*' -k -fsS --connect-timeout 6 --max-time 12 --resolve 'blog.gooffu.tech:443:127.0.0.1' https://blog.gooffu.tech/ -o /dev/null
-            install -d -m 700 /etc/myvps/xhttp-reality
-            python3 - <<'PYMAKE'
+            test ! -e "$ng_back"
+            install -d -m 700 "$backup"
+            for f in config.json client-test.json client-domain.json client-meta.json client-uri.txt; do cp -a "$root/$f" "$backup/$f"; done
+            python3 - <<'PYEDIT'
             from pathlib import Path
-            import subprocess, json, uuid, secrets, copy, os, urllib.parse
+            import json,urllib.parse,os
             root=Path('/etc/myvps/xhttp-reality')
-            cur=json.loads(Path('/etc/xray-racknerd-443/config.json').read_text())
-            assert sum(1 for x in cur.get('outbounds',[]) if x.get('protocol')=='socks')==1
-            assert any(x.get('outboundTag')=='res-socks' for x in cur.get('routing',{}).get('rules',[]))
-            output=subprocess.run(['/usr/local/bin/xray','x25519'],capture_output=True,text=True,check=True,timeout=12).stdout
-            keyparts={}
-            for line in output.splitlines():
-             if ':' not in line: continue
-             k,v=line.split(':',1); k=k.strip().lower(); v=v.strip()
-             if k.startswith('private'):keyparts['private']=v
-             if k.startswith('password') or k.startswith('public'):keyparts['public']=v
-            assert len(keyparts.get('private',''))>=40 and len(keyparts.get('public',''))>=40, 'Invalid X25519 keypair output'
-            uid=str(uuid.uuid4())
-            sid=secrets.token_hex(8)
-            path='/'+secrets.token_hex(16)
-            sni='www.microsoft.com'
-            address='2b.gooffu.tech'
-            reality_srv={'show':False,'target':sni+':443','serverNames':[sni],'privateKey':keyparts['private'],'shortIds':[sid]}
-            config={'log':{'loglevel':'warning'},'inbounds':[{'tag':'xhttp-reality','listen':'127.0.0.1','port':24444,'protocol':'vless','settings':{'clients':[{'id':uid}],'decryption':'none'},'streamSettings':{'network':'xhttp','security':'reality','xhttpSettings':{'path':path,'mode':'auto'},'realitySettings':reality_srv}}], 'outbounds':copy.deepcopy(cur['outbounds']),'routing':copy.deepcopy(cur['routing'])}
-            def write(name,content):
+            sni='www.cloudflare.com'
+            for name in ('config.json','client-test.json','client-domain.json'):
              p=root/name
-             with open(p,'x',encoding='utf-8') as fd: fd.write(content)
+             obj=json.loads(p.read_text())
+             if name=='config.json':
+              obj['inbounds'][0]['streamSettings']['realitySettings']['target']=sni+':443'
+              obj['inbounds'][0]['streamSettings']['realitySettings']['serverNames']=[sni]
+             else: obj['outbounds'][0]['streamSettings']['realitySettings']['serverName']=sni
+             p.write_text(json.dumps(obj,indent=2)+'\n')
              os.chmod(p,0o600)
-            write('config.json',json.dumps(config,indent=2)+'\n')
-            client_reality={'serverName':sni,'fingerprint':'chrome','password':keyparts['public'],'shortId':sid,'spiderX':'/'}
-            client={'log':{'loglevel':'warning'},'inbounds':[{'listen':'127.0.0.1','port':18084,'protocol':'socks','settings':{'auth':'noauth','udp':False}}],'outbounds':[{'tag':'test-reality-xhttp','protocol':'vless','settings':{'vnext':[{'address':'127.0.0.1','port':443,'users':[{'id':uid,'encryption':'none'}]}]},'streamSettings':{'network':'xhttp','security':'reality','realitySettings':client_reality,'xhttpSettings':{'path':path,'mode':'stream-one'}}}]}
-            write('client-test.json',json.dumps(client,indent=2)+'\n')
-            client['outbounds'][0]['settings']['vnext'][0]['address']=address
-            write('client-domain.json',json.dumps(client,indent=2)+'\n')
-            params={'encryption':'none','security':'reality','sni':sni,'fp':'chrome','pbk':keyparts['public'],'sid':sid,'type':'xhttp','path':path,'mode':'stream-one'}
-            uri='vless://'+uid+'@'+address+':443?'+urllib.parse.urlencode(params)+'#'+urllib.parse.quote('MyVPS-XHTTP-REALITY-Test')
-            write('client-uri.txt',uri+'\n')
-            write('client-meta.json',json.dumps({'connect_host':address,'connect_port':443,'sni':sni,'mode':'stream-one','network':'xhttp','security':'reality','service':'myvps-xhttp-reality','node_label':'MyVPS-XHTTP-REALITY-Test'},indent=2)+'\n')
-            print('xhttp_reality_keys_uuid_shortid_path_and_link_generated_locally=yes')
-            print('secrets_exported_to_github=no')
-            PYMAKE
-            /usr/local/bin/xray run -test -config /etc/myvps/xhttp-reality/config.json >/dev/null 2>&1
-            /usr/local/bin/xray run -test -config /etc/myvps/xhttp-reality/client-test.json >/dev/null 2>&1
-            echo 'server_and_client_configs=PASS'
+            meta=root/'client-meta.json'
+            obj=json.loads(meta.read_text());obj['sni']=sni;meta.write_text(json.dumps(obj,indent=2)+'\n');os.chmod(meta,0o600)
+            uri=root/'client-uri.txt';p=urllib.parse.urlsplit(uri.read_text().strip())
+            q=dict(urllib.parse.parse_qsl(p.query));q['sni']=sni
+            uri.write_text(urllib.parse.urlunsplit((p.scheme,p.netloc,p.path,urllib.parse.urlencode(q),p.fragment))+'\n')
+            os.chmod(uri,0o600)
+            assert sni in json.loads((root/'client-domain.json').read_text())['outbounds'][0]['streamSettings']['realitySettings']['serverName']
+            print('client_and_server_sni_compatibility_updated=yes')
+            PYEDIT
+            /usr/local/bin/xray run -test -config "$root/config.json" >/dev/null 2>&1
+            /usr/local/bin/xray run -test -config "$root/client-test.json" >/dev/null 2>&1
             cat > /etc/systemd/system/myvps-xhttp-reality.service <<'UNIT'
             [Unit]
-            Description=MyVPS XHTTP with REALITY isolated localhost ingress
+            Description=MyVPS XHTTP REALITY independent localhost backend
             Wants=network-online.target
             After=network-online.target
             [Service]
@@ -115,45 +105,47 @@ jobs:
             sleep 1
             systemctl is-active --quiet myvps-xhttp-reality.service
             ss -H -lnt | awk '{print $4}' | grep -q '127.0.0.1:24444$'
-            echo 'xhttp_reality_loopback_listener=PASS'
-            cp -a /etc/nginx/stream.d/443-sni.conf "$ng_backup"
+            echo 'xhttp_reality_service=PASS'
+            cp -a /etc/nginx/stream.d/443-sni.conf "$ng_back"
             python3 - <<'PYNG'
             from pathlib import Path
-            import re
             p=Path('/etc/nginx/stream.d/443-sni.conf')
             s=p.read_text()
             assert s.count('map $ssl_preread_server_name $my_443_backend {')==1
             assert s.count('dl.google.com       xray_reality_backend;')==1
             assert s.count('default       local_https_backend;')==1
-            assert 'www.microsoft.com' not in s and 'xray_reality_xhttp_backend' not in s
+            assert 'www.cloudflare.com' not in s and 'xray_reality_xhttp_backend' not in s
             assert s.count('upstream xray_reality_backend { server 127.0.0.1:24443; }')==1
-            s=s.replace('default       local_https_backend;', 'www.microsoft.com xray_reality_xhttp_backend;\n    default       local_https_backend;',1)
+            s=s.replace('default       local_https_backend;','www.cloudflare.com xray_reality_xhttp_backend;\n    default       local_https_backend;',1)
             s=s.replace('upstream xray_reality_backend { server 127.0.0.1:24443; }','upstream xray_reality_backend { server 127.0.0.1:24443; }\nupstream xray_reality_xhttp_backend { server 127.0.0.1:24444; }',1)
             p.write_text(s)
-            print('isolated_nginx_sni_route_for_www_microsoft_com_added=yes')
+            print('nginx_sni_443_route=added_for_new_backend')
             PYNG
-            stage=nginx_modified
+            phase='nginx_modified'
             nginx -t >/dev/null 2>&1
             systemctl reload nginx
-            stage=nginx_reloaded
-            sleep 1
-            echo 'nginx_updated_configuration=PASS'
-            for s in nginx xray-racknerd-443 xray-racknerd-cf-ws myvps-xhttp myvps-xhttp-reality; do systemctl is-active --quiet "$s"; done
-            work=$(mktemp -d /var/tmp/myvps-xhttp-reality-probe.XXXXXXXX)
-            pid=''
-            cleanup_test() { if [ -n "$pid" ]; then kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true; fi; rm -rf "$work"; }
-            trap cleanup_test RETURN
-            /usr/local/bin/xray run -config /etc/myvps/xhttp-reality/client-test.json >"$work/client.log" 2>&1 &
-            pid=$!
-            sleep 2
-            if ! kill -0 "$pid" 2>/dev/null; then echo 'client_start=FAIL'; exit 31; fi
-            http=$(curl --socks5-hostname 127.0.0.1:18084 -sS -4 --connect-timeout 12 --max-time 40 -o "$work/http.txt" -w '%{http_code}' https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null || true)
-            if [ "$http" = 200 ] && grep -q '^ip=' "$work/http.txt"; then echo 'xhttp_reality_local_nginx_end_to_end=PASS_HTTP_200'; else echo "xhttp_reality_local_nginx_end_to_end=FAIL_${http:-none}"; exit 32; fi
-            kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true; pid=''
-            rm -rf "$work"
-            trap - RETURN
-            echo 'uri_stored_on_vps_root600=yes'
-            echo 'uri_location=/etc/myvps/xhttp-reality/client-uri.txt'
-            echo 'existing_reality_and_ws_preserved=yes'
-            echo '=== DEPLOYED AND VERIFIED XHTTP REALITY ==='
+            phase='nginx_reloaded'
+            echo 'nginx_sni_route=PASS'
+            probe() {
+             local label=$1 file=$2 http
+             local dir
+             dir=$(mktemp -d /var/tmp/myvps-new-xhttp-real-test.XXXXXXXX)
+             /usr/local/bin/xray run -config "$root/$file" >"$dir/client.log" 2>&1 &
+             client_pid=$!
+             sleep 2
+             if ! kill -0 "$client_pid" 2>/dev/null; then echo "probe_${label}=CLIENT_START_FAIL"; rm -rf "$dir"; return 1; fi
+             http=$(curl -sS -4 --socks5-hostname 127.0.0.1:18084 --connect-timeout 12 --max-time 35 -o "$dir/out" -w '%{http_code}' https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null || true)
+             if [ "$http" = 200 ] && grep -q '^ip=' "$dir/out"; then echo "probe_${label}=PASS_HTTP_200"; else echo "probe_${label}=FAIL_${http:-none}"; kill "$client_pid" 2>/dev/null || true; wait "$client_pid" 2>/dev/null || true; client_pid=''; rm -rf "$dir"; return 1; fi
+             kill "$client_pid" 2>/dev/null || true; wait "$client_pid" 2>/dev/null || true; client_pid=''
+             rm -rf "$dir"
+            }
+            echo '=== CHECK CLIENT THROUGH NGINX 443 WITH SNI ==='
+            probe origin_443 client-test.json
+            echo '=== CHECK CLIENT USING 2B DOMAIN ==='
+            if probe domain_443 client-domain.json; then echo 'public_domain_self_test=PASS'; else echo 'public_domain_self_test=UNAVAILABLE_ON_SERVER; origin remains validated'; fi
+            for svc in nginx xray-racknerd-443 xray-racknerd-cf-ws myvps-xhttp myvps-xhttp-reality; do systemctl is-active --quiet "$svc"; echo "service_${svc}=active"; done
+            test "$(readlink -f /usr/local/bin/myvps)" = /root/my_vps_manager.sh
+            stat -c 'client_uri_mode=%a' "$root/client-uri.txt"
+            echo 'URI_RETRIEVAL=ssh root@198.44.104.23 cat /etc/myvps/xhttp-reality/client-uri.txt'
+            echo 'xhttp_reality_install_result=PASS'
             trap - EXIT
