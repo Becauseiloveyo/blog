@@ -1,0 +1,93 @@
+name: Read-only VPS health audit (temporary)
+on:
+  push:
+    branches:
+      - ops/read-only-vps-audit-20261008
+    paths:
+      - .github/workflows/vps-audit.yml
+permissions:
+  contents: read
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 4
+    steps:
+      - name: Connect using existing GitHub SSH Secrets and read status
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: ${{ secrets.SERVER_USER }}
+          key: ${{ secrets.SERVER_SSH_KEY }}
+          port: ${{ secrets.SERVER_PORT || 22 }}
+          timeout: 35s
+          command_timeout: 90s
+          script_stop: true
+          script: |
+            set -u
+            export LC_ALL=C
+            echo '=== VPS READ-ONLY HEALTH AUDIT ==='
+            printf 'UTC: '; date -u '+%Y-%m-%d %H:%M:%S'
+            printf 'OS: '; ( . /etc/os-release; printf '%s\n' "$PRETTY_NAME" ) 2>/dev/null || echo unknown
+            printf 'Kernel: '; uname -r
+            printf 'Uptime: '; uptime -p 2>/dev/null || true
+            printf 'CPU threads: '; nproc 2>/dev/null || true
+            printf 'Memory: '; free -h | awk '/^Mem:/ {printf "total=%s used=%s available=%s\n",$2,$3,$7}'
+            printf 'Root disk: '; df -h / | awk 'NR==2 {printf "size=%s used=%s available=%s use=%s\n",$2,$3,$4,$5}'
+            echo '--- Service state ---'
+            for svc in ssh nginx xray xray-racknerd-443 xray-racknerd-cf myvps-xray AdGuardHome adguardhome fail2ban; do
+              if systemctl list-unit-files "$svc.service" --no-legend 2>/dev/null | grep -q .; then
+                printf '%s: %s\n' "$svc" "$(systemctl is-active "$svc" 2>/dev/null || true)"
+              else
+                printf '%s: no unit\n' "$svc"
+              fi
+            done
+            echo '--- TCP LISTEN status ---'
+            if command -v ss >/dev/null 2>&1; then
+              for port in 22 80 443 3000 8443 2053 15593 15594; do
+                if ss -H -lnt | awk '{print $4}' | grep -Eq ":$port$"; then
+                  printf 'TCP/%s: listening\n' "$port"
+                else
+                  printf 'TCP/%s: not listening\n' "$port"
+                fi
+              done
+            fi
+            echo '--- Configuration checks (secrets suppressed) ---'
+            if command -v nginx >/dev/null 2>&1; then
+              if nginx -t >/dev/null 2>&1; then echo 'nginx syntax: PASS'; else echo 'nginx syntax: FAIL'; fi
+            fi
+            xraybin=''
+            for f in /usr/local/bin/xray /usr/bin/xray /opt/myvps/xray/xray; do
+              if [ -x "$f" ]; then xraybin="$f"; break; fi
+            done
+            if [ -n "$xraybin" ]; then
+              printf 'Xray version: '; "$xraybin" version 2>/dev/null | head -n 1 || true
+            else
+              echo 'Xray binary: not found in expected locations'
+            fi
+            for config in /etc/xray-racknerd-443/config.json /usr/local/etc/xray/config.json /etc/myvps/xray/config.json; do
+              if [ -f "$config" ]; then
+                case "$config" in
+                  /etc/xray-racknerd-443/*) kind='REALITY-443' ;;
+                  /usr/local/etc/xray/*) kind='Xray-standard' ;;
+                  *) kind='owned-Xray' ;;
+                esac
+                if [ -n "$xraybin" ]; then
+                  if "$xraybin" run -test -config "$config" >/dev/null 2>&1; then echo "$kind config: PASS"
+                  else echo "$kind config: FAIL or version mismatch"; fi
+                fi
+                if command -v jq >/dev/null 2>&1; then
+                  jq -r --arg kind "$kind" '
+                    $kind + " inbounds: " + ([.inbounds[]?.protocol] | group_by(.) | map(.[0] + "=" + (length|tostring)) | join(",")),
+                    $kind + " outbounds: " + ([.outbounds[]?.protocol] | group_by(.) | map(.[0] + "=" + (length|tostring)) | join(",")),
+                    $kind + " routing rules count: " + ((.routing.rules // [] | length) | tostring)
+                  ' "$config" 2>/dev/null || echo "$kind summary: unavailable"
+                fi
+              fi
+            done
+            echo '--- Backup tools ---'
+            for cmd in rclone gpg tar; do if command -v "$cmd" >/dev/null 2>&1; then echo "$cmd: installed"; else echo "$cmd: absent"; fi; done
+            echo '--- PM2 process summary (no env vars) ---'
+            if command -v pm2 >/dev/null 2>&1; then
+              pm2 jlist 2>/dev/null | jq -r '.[] | "app: " + (.name // "unnamed") + " status: " + (.pm2_env.status // "unknown")' 2>/dev/null || echo 'PM2: unavailable'
+            fi
+            echo '=== END READ-ONLY AUDIT ==='
