@@ -1,4 +1,4 @@
-name: Temporary XHTTP topology preflight
+name: Temporary nginx route shape inspection
 on:
   push:
     branches:
@@ -10,9 +10,9 @@ permissions:
 jobs:
   inspect:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 4
     steps:
-      - name: Read-only Xray/nginx topology and local SNI routes
+      - name: Inspect CF server block shape without paths or keys
         uses: appleboy/ssh-action@v1.0.3
         with:
           host: ${{ secrets.SERVER_HOST }}
@@ -20,29 +20,34 @@ jobs:
           key: ${{ secrets.SERVER_SSH_KEY }}
           port: ${{ secrets.SERVER_PORT || 22 }}
           timeout: 35s
-          command_timeout: 160s
+          command_timeout: 130s
           script_stop: false
           script: |
             set +e
-            echo '=== CURRENT XRAY AND NETWORK ==='
-            for s in nginx xray-racknerd-443 cron; do printf 'service_%s=' "$s"; systemctl is-active "$s" 2>/dev/null; done
-            printf 'xray_version='; /usr/local/bin/xray version 2>/dev/null | head -1
-            printf 'nginx_syntax='; nginx -t >/dev/null 2>&1 && echo PASS || echo FAIL
-            for port in 80 443 3000 8443 2053 15593 15594 18080 18081 18082; do printf 'tcp_%s=' "$port"; ss -H -lnt 2>/dev/null | awk '{print $4}' | grep -Ec ":$port$" || true; done
-            echo '=== STREAM ROUTING (DOMAIN + LOCAL PORT ONLY) ==='
-            nginx -T 2>/dev/null | python3 -c 'import sys,re; t=sys.stdin.read(); print("nginx_stream_blocks="+str(len(re.findall(r"(?m)^\s*stream\s*\{",t))));print("nginx_http_blocks="+str(len(re.findall(r"(?m)^\s*http\s*\{",t)))); names=re.findall(r"(?m)^\s*server_name\s+([^;]+);",t);print("http_server_names="+",".join(names[:20])); print("listen_entries="+",".join(re.findall(r"(?m)^\s*listen\s+([^;]+);",t)[:30])); print("nginx_conf_files="+str(len(re.findall(r"configuration file",t))))'
-            echo '=== HTTPS DOMAINS (LOCAL ORIGIN) ==='
-            for host in cf.gooffu.tech blog.gooffu.tech; do
-             code=$(curl --noproxy '*' -sS --connect-timeout 5 --max-time 10 --resolve "$host:443:127.0.0.1" -k -o /dev/null -w '%{http_code}|%{http_version}|%{remote_port}' "https://$host/" 2>/dev/null)
-             echo "localhost_sni_${host}=$code"
-            done
-            echo '=== XRAY AND CF WS TOPOLOGY ==='
-            for f in /etc/xray-racknerd-443/config.json /etc/xray-racknerd-cf/config.json /etc/xray-cf-ws/config.json /usr/local/etc/xray/config.json; do
-             if [ -r "$f" ]; then
-              case "$f" in */xray-racknerd-443/*) k=reality;; *cf*) k=cfws;; *) k=other;; esac
-              jq -r --arg k "$k" '"in_"+$k+"="+([.inbounds[]? | (.protocol//"-")+"/"+(.streamSettings.network//"-")+"/"+(.streamSettings.security//"-")+"/"+((.port//0)|tostring)]|join(",")),"out_"+$k+"="+([.outbounds[]?|(.tag//"-")+"="+(.protocol//"-")]|join(","))' "$f" 2>/dev/null || true
-             fi
-            done
-            printf 'systemd_xray_related='; systemctl list-units --all --type=service --no-legend 2>/dev/null | awk 'tolower($1)~/xray/ {print $1}' | tr '\n' ','; echo
-            printf 'disk_free_mb='; df -Pm / | awk 'NR==2{print $4}'
+            echo '=== NGINX FILES CONTAINING CF HOST ==='
+            python3 - <<'PY'
+            from pathlib import Path
+            import re
+            for p in Path('/etc/nginx').rglob('*'):
+             if not p.is_file() or p.is_symlink(): continue
+             try:s=p.read_text(errors='replace')
+             except (OSError,UnicodeError):continue
+             if 'cf.gooffu.tech' not in s: continue
+             print('config_file='+str(p))
+             for line in s.splitlines():
+              l=line.strip()
+              if re.search(r'^\s*(server|http|stream)\s*\{',l): print('  '+l)
+              elif l.startswith('listen '): print('  '+l)
+              elif l.startswith('server_name '): print('  '+l)
+              elif l.startswith('location '):print('  location=<existing>')
+              elif l.startswith('proxy_pass ') or l.startswith('grpc_pass '):
+               print('  '+re.sub(r'(?:127\.0\.0\.1|localhost):\d+', '127.0.0.1:<port>',l))
+              elif l.startswith('include '):print('  '+l)
+            PY
+            echo '=== STREAM CONNECTIONS AND CF SERVICES ==='
+            for x in xray-racknerd-cf-ws nginx xray-racknerd-443; do echo "$x=$(systemctl is-active "$x" 2>/dev/null)"; done
+            printf 'cf_xray_service_command='; systemctl show xray-racknerd-cf-ws -p ExecStart --value 2>/dev/null | sed -E 's/config[^ ]*\.json/config.json/g;s#/[a-zA-Z0-9._/-]+\.json#<json>#g' | cut -c 1-140
+            echo
+            echo '=== CERT DOMAIN SCOPE ==='
+            for f in /etc/nginx/sites-enabled/* /etc/nginx/conf.d/*; do [ -f "$f" ] || continue; if grep -q 'cf.gooffu.tech' "$f"; then printf 'candidate=%s ' "$f"; wc -l < "$f"; fi; done
             echo '=== DONE ==='
