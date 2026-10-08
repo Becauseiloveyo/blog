@@ -1,0 +1,90 @@
+name: Temporary cloud backup guide upload
+on:
+  push:
+    branches:
+      - ops/read-only-vps-audit-20261008
+    paths:
+      - .github/workflows/backup-cloud-guide.yml
+permissions:
+  contents: read
+jobs:
+  label:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Place cloud recovery guide without passphrase
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: ${{ secrets.SERVER_USER }}
+          key: ${{ secrets.SERVER_SSH_KEY }}
+          port: ${{ secrets.SERVER_PORT || 22 }}
+          timeout: 35s
+          command_timeout: 180s
+          script_stop: true
+          script: |
+            set -Eeuo pipefail
+            umask 077
+            R=$(cat /etc/myvps/backup.remote)
+            [[ "$R" =~ ^[A-Za-z][A-Za-z0-9_-]*:$ ]] || exit 2
+            F=$(mktemp /var/tmp/myvps-cloud-readme.XXXXXXXX)
+            trap 'rm -f "$F"' EXIT
+            cat > "$F" <<'BACKUP_GUIDE'
+            VPS 云端备份与恢复说明（重要）
+            更新日期：2026-10-08
+            
+            一、备份目录
+            Google Drive / VPS-Backups/
+            新备份文件不会覆盖旧备份：
+              myvps-config-YYYYMMDDTHHMMSSZ.tar.gz.gpg  — 系统配置、代理相关配置、管理脚本
+              myvps-blog-YYYYMMDDTHHMMSSZ.tar.gz.gpg    — 博客程序及数据（SQLite 在线一致性快照）
+            请保留 2026 年 6 月的历史归档，勿误删。
+            
+            二、自动计划（北京时间，Asia/Shanghai）
+            每日 02:00  系统配置备份
+            每日 02:30  博客与 SQLite 数据备份
+            systemd timers:
+              myvps-backup-config.timer
+              myvps-backup-blog.timer
+            
+            三、加密与恢复密钥 —— 特别重要
+            归档格式：tar.gz 经过 GPG AES-256 对称加密，扩展名 .tar.gz.gpg。
+            解密密钥目前位于 VPS：/etc/myvps/backup.pass （文件权限 600）。
+            注意：该密钥故意未上传至此云盘，也不包含在 config/blog 归档中。
+            必须另行复制到可信的离线介质、密码管理器或使用独立密码加密的安全保管库。
+            如果 VPS 丢失且没有保留密钥，即使云端备份存在也无法解密。
+            禁止将该文件公开分享、放进公开 GitHub 仓库或发送给他人。
+            
+            四、检查和恢复（仅在可信测试环境操作）
+            VPS 备份工具：/opt/myvps/backup/myvps_backup.sh
+            命令：
+              sudo bash /opt/myvps/backup/myvps_backup.sh restore-test config
+              sudo bash /opt/myvps/backup/myvps_backup.sh restore-test blog
+            这两条命令从云端下载最新归档并解密验证，不覆盖线上文件。
+            
+            若需手动查看已下载的归档目录（请使用已经安全保存的密钥文件）：
+              gpg --batch --pinentry-mode loopback --passphrase-file /path/to/backup.pass --decrypt backup.tar.gz.gpg | tar -tzf -
+            完整恢复时应先解密到隔离目录并检查，再选择性恢复配置或业务数据；不可直接覆盖生产系统。
+            对于 SQLite，应检查备份库的完整性及业务可用性。
+            备份为文件级配置与博客数据，不是整机硬盘镜像。
+            
+            五、管理与异常排查
+              systemctl list-timers --all | grep myvps-backup
+              systemctl status myvps-backup-config.timer myvps-backup-blog.timer
+              journalctl -u myvps-backup-config.service -u myvps-backup-blog.service --no-pager
+            如遇 Google Drive 403 RATE_LIMIT_EXCEEDED，可能是 API 配额限制；应核对远端状态并降低请求速率。
+            定期检查新备份日期和恢复验证结果；仅看到 timer active 并不能说明上传成功。
+            
+            最后核验：2026-10-08，新建 config 与 blog 归档各一份，上传校验通过，云端下载解密验证通过。
+            注意：尚未进行完整异机业务恢复演练。
+            
+            BACKUP_GUIDE
+            chmod 600 "$F"
+            echo 'Uploading explanatory README; not uploading passphrase.'
+            rclone copyto "$F" "${R}VPS-Backups/00-重要-备份与恢复说明.txt" --retries 4 --low-level-retries 8 --tpslimit 1 --tpslimit-burst 1
+            rclone check "$(dirname "$F")" "${R}VPS-Backups" --one-way --include "$(basename "$F")" --checkers 1 >/dev/null 2>&1 || true
+            localhash=$(sha256sum "$F" | awk '{print $1}')
+            remotehash=$(rclone cat "${R}VPS-Backups/00-重要-备份与恢复说明.txt" --tpslimit 1 --tpslimit-burst 1 | sha256sum | awk '{print $1}')
+            [[ "$localhash" == "$remotehash" ]] || { echo 'Cloud read-back SHA256 mismatch'; exit 1; }
+            echo 'Cloud README uploaded and SHA256 read-back verified.'
+            echo 'Actual passphrase was not copied to cloud.'
