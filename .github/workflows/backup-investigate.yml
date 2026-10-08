@@ -1,4 +1,4 @@
-name: VPS backup root cause followup
+name: Temporary latest cloud backup metadata check
 on:
   push:
     branches:
@@ -10,9 +10,9 @@ permissions:
 jobs:
   audit:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 4
     steps:
-      - name: Inspect cron script identities and cloud backup paths without secrets
+      - name: Read-only Google Drive backup age and count
         uses: appleboy/ssh-action@v1.0.3
         with:
           host: ${{ secrets.SERVER_HOST }}
@@ -20,62 +20,31 @@ jobs:
           key: ${{ secrets.SERVER_SSH_KEY }}
           port: ${{ secrets.SERVER_PORT || 22 }}
           timeout: 35s
-          command_timeout: 230s
+          command_timeout: 90s
           script_stop: false
           script: |
             set +e
             export LC_ALL=C
-            echo '=== CRON EXECUTABLES ==='
+            echo '=== DRIVE BACKUP METADATA (NO FILENAMES) ==='
             python3 - <<'PY'
-            import subprocess,shlex,os
-            p=subprocess.run(['crontab','-l'],capture_output=True,text=True)
-            for i,line in enumerate((v.strip() for v in p.stdout.splitlines() if v.strip() and not v.lstrip().startswith('#')),1):
-             parts=line.split(None,5)
-             if len(parts)<6:continue
-             s=parts[5]
-             try:t=shlex.split(s)
-             except ValueError:t=s.split()
-             exe=os.path.basename(t[0]) if t else 'none'
-             program=os.path.basename(t[1]) if len(t)>1 and exe in ('bash','sh','python','python3','/bin/sh') else 'none'
-             print(f'cron_{i}_command={exe} script_basename={program}')
+            import subprocess,json,datetime
+            remotes=subprocess.run(['rclone','listremotes'],text=True,capture_output=True,timeout=5).stdout.splitlines()
+            for i,remote in enumerate(remotes[:3],1):
+             if i!=2: continue
+             try:
+              x=subprocess.run(['rclone','lsjson','--recursive','--files-only','--max-depth','5',remote+'VPS-Backups'],capture_output=True,text=True,timeout=27)
+              if x.returncode: print(f'remote_{i}_backup_listing=FAILED');continue
+              data=json.loads(x.stdout)
+              files=[j for j in data if not j.get('IsDir')]
+              dates=[]
+              for o in files:
+               try: dates.append(datetime.datetime.fromisoformat(o['ModTime'].replace('Z','+00:00')))
+               except Exception:pass
+              print(f'remote_{i}_backup_file_count={len(files)}')
+              print(f'remote_{i}_backup_total_bytes={sum(int(o.get("Size",0)) for o in files)}')
+              if dates: print(f'remote_{i}_latest_backup_modified_utc={max(dates).isoformat()}')
+              print(f'remote_{i}_backup_metadata_only=yes')
+             except subprocess.TimeoutExpired: print(f'remote_{i}_backup_listing=TIMEOUT')
+             except Exception as e: print(f'remote_{i}_backup_listing={type(e).__name__}')
             PY
-            echo '=== RCLONE BACKEND TYPES (NO CONFIG DUMP) ==='
-            python3 - <<'PY'
-            import configparser,subprocess
-            p=subprocess.run(['rclone','config','file'],text=True,capture_output=True)
-            lines=[s.strip() for s in p.stdout.splitlines() if s.strip()]
-            path=next((s for s in reversed(lines) if s.startswith('/')),None)
-            if path:
-             c=configparser.ConfigParser(interpolation=None); c.read(path)
-             for i,name in enumerate(c.sections(),1):
-              print('remote_'+str(i)+'_backend='+c[name].get('type','unknown'))
-            else:print('remote_backend_info=unavailable')
-            PY
-            echo '=== CLOUD BACKUP PATH PROBES ==='
-            i=0
-            while IFS= read -r remote; do
-             i=$((i+1)); [ "$i" -le 3 ] || break
-             for p in 'VPS-Backups/racknerd/full' 'VPS-Backups/racknerd/blog' 'VPS-Backups' 'backup' 'backups'; do
-              if timeout 7 rclone lsf --max-depth 1 "$remote$p" >/dev/null 2>&1; then echo "remote_${i}_path_${p//\//_}=ACCESSIBLE"; else echo "remote_${i}_path_${p//\//_}=NOT_ACCESSIBLE_OR_MISSING"; fi
-             done
-            done < <(rclone listremotes 2>/dev/null)
-            echo '=== SYSTEM CRON BACKUP JOB CLASSIFICATION ==='
-            python3 - <<'PY'
-            from pathlib import Path
-            for base in ('/etc/cron.d','/etc/cron.daily','/etc/cron.weekly','/etc/systemd/system'):
-             p=Path(base)
-             if not p.is_dir():continue
-             found=[]
-             for f in p.iterdir():
-              if not f.is_file():continue
-              if 'backup' in f.name.lower() or 'rclone' in f.name.lower(): found.append(f.name)
-             print('location='+base+' related_job_count='+str(len(found)))
-             for x in found[:10]:print(' related_job_name='+x)
-            PY
-            echo '=== CRON JOURNAL LATEST EVIDENCE ==='
-            for label in 24h 7d; do
-             duration='1 day ago'; [ "$label" = '7d' ] && duration='7 days ago'
-             printf 'cron_cmd_count_%s=' "$label"
-             journalctl -u cron --since "$duration" -o cat --no-pager 2>/dev/null | grep -c '(CRON) info (No MTA installed, discarding output)' || true
-            done
-            echo '=== FINISHED ==='
+            echo '=== END ==='
