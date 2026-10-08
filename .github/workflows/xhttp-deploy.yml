@@ -21,7 +21,7 @@ jobs:
           port: ${{ secrets.SERVER_PORT || 22 }}
           timeout: 40s
           command_timeout: 250s
-          script_stop: true
+          script_stop: false
           script: |
             set -Eeuo pipefail
             umask 077
