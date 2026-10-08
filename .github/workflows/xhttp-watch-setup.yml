@@ -1,0 +1,82 @@
+name: Temporary XHTTP manager and backup watch deployment
+on:
+  push:
+    branches:
+      - ops/read-only-vps-audit-20261008
+    paths:
+      - .github/workflows/xhttp-watch-setup.yml
+permissions:
+  contents: read
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    steps:
+      - name: Deploy backup freshness journal watchdog and updated myvps-next
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: ${{ secrets.SERVER_USER }}
+          key: ${{ secrets.SERVER_SSH_KEY }}
+          port: ${{ secrets.SERVER_PORT || 22 }}
+          timeout: 40s
+          command_timeout: 230s
+          script_stop: false
+          script: |
+            set -Eeuo pipefail
+            umask 077
+            echo '=== MyVPS XHTTP STATUS + BACKUP WATCH SETUP ==='
+            base='https://raw.githubusercontent.com/Becauseiloveyo/racknerd-v2ray-agent-manager/c6a402d8f1b5bb450115ca4f780dc13e97d3e2e8'
+            tmp=$(mktemp -d /var/tmp/myvps-watch.XXXXXXXX)
+            trap 'rm -rf "$tmp"' EXIT
+            for name in my_vps_manager.sh myvps_runtime.py myvps_backup_watch.py; do
+              curl -fLsS --retry 3 --connect-timeout 10 --max-time 50 -o "$tmp/$name" "$base/$name"
+            done
+            bash -n "$tmp/my_vps_manager.sh"
+            PYTHONDONTWRITEBYTECODE=1 python3 -c 'import ast,sys; [ast.parse(open(p).read()) for p in sys.argv[1:]]' "$tmp/myvps_runtime.py" "$tmp/myvps_backup_watch.py"
+            python3 "$tmp/myvps_backup_watch.py" --self-test
+            grep -Fq 'VERSION="2.3.1-rc2"' "$tmp/my_vps_manager.sh"
+            grep -Fq 'SELF="/opt/myvps/bin/my_vps_manager.sh"' "$tmp/my_vps_manager.sh"
+            for name in my_vps_manager.sh myvps_runtime.py myvps_backup_watch.py; do
+              if [ -f "/opt/myvps/bin/$name" ]; then cp -a "/opt/myvps/bin/$name" "/opt/myvps/bin/$name.previous"; fi
+              install -m 700 "$tmp/$name" "/opt/myvps/bin/$name"
+            done
+            ln -sfn /opt/myvps/bin/my_vps_manager.sh /usr/local/bin/myvps-next
+            echo '=== REAL BACKUP HEALTH CHECK ==='
+            python3 /opt/myvps/bin/myvps_backup_watch.py --max-age-hours 36
+            echo '=== VERIFY SYSTEMD TIMER EXPRESSION ==='
+            systemd-analyze calendar '*-*-* 04,10,16,22:00:00 Asia/Shanghai' >/dev/null
+            cat > /etc/systemd/system/myvps-backup-watch.service <<'UNIT'
+            [Unit]
+            Description=MyVPS cloud backup freshness watchdog (local journal alerts)
+            Wants=network-online.target
+            After=network-online.target
+            [Service]
+            Type=oneshot
+            ExecStart=/usr/bin/python3 /opt/myvps/bin/myvps_backup_watch.py --max-age-hours 36
+            TimeoutStartSec=90s
+            Nice=15
+            NoNewPrivileges=true
+            [Install]
+            WantedBy=multi-user.target
+            UNIT
+            cat > /etc/systemd/system/myvps-backup-watch.timer <<'UNIT'
+            [Unit]
+            Description=Check Google Drive backup age four times daily
+            [Timer]
+            OnCalendar=*-*-* 04,10,16,22:00:00 Asia/Shanghai
+            Persistent=false
+            Unit=myvps-backup-watch.service
+            [Install]
+            WantedBy=timers.target
+            UNIT
+            chmod 644 /etc/systemd/system/myvps-backup-watch.service /etc/systemd/system/myvps-backup-watch.timer
+            systemctl daemon-reload
+            systemctl enable --now myvps-backup-watch.timer
+            systemctl is-active --quiet myvps-backup-watch.timer
+            echo '=== XHTTP STATUS ==='
+            bash /usr/local/bin/myvps-next xhttp-status
+            echo '=== BACKUP TIMER SAFETY ==='
+            for t in myvps-backup-config.timer myvps-backup-blog.timer; do systemctl is-active --quiet "$t"; echo "$t=active"; done
+            for s in nginx xray-racknerd-443 xray-racknerd-cf-ws myvps-xhttp fail2ban; do systemctl is-active --quiet "$s"; echo "$s=active"; done
+            echo '=== COMPLETE: LOCAL ALERT WATCHDOG ENABLED ==='
