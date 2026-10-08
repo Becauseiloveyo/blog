@@ -1,4 +1,4 @@
-name: Temporary safe stream SNI map detail
+name: Temporary XHTTP REALITY sanitized failed-connection diagnostics
 on:
   push:
     branches:
@@ -8,11 +8,11 @@ on:
 permissions:
   contents: read
 jobs:
-  preflight:
+  inspect:
     runs-on: ubuntu-latest
     timeout-minutes: 4
     steps:
-      - name: Review nginx stream map keys for safe new SNI
+      - name: Inspect sanitized client and service error logs
         uses: appleboy/ssh-action@v1.0.3
         with:
           host: ${{ secrets.SERVER_HOST }}
@@ -20,18 +20,37 @@ jobs:
           key: ${{ secrets.SERVER_SSH_KEY }}
           port: ${{ secrets.SERVER_PORT || 22 }}
           timeout: 35s
-          command_timeout: 150s
+          command_timeout: 140s
           script_stop: false
           script: |
-            set -Eeuo pipefail
-            echo '=== NGINX STREAM 443 SANITIZED STRUCTURE ==='
+            set +e
+            echo '=== XHTTP REALITY FAILURE DIAGNOSTICS (SANITIZED) ==='
             python3 - <<'PY'
-            from pathlib import Path
-            s=Path('/etc/nginx/stream.d/443-sni.conf').read_text()
-            for i,line in enumerate(s.splitlines(),1):
-             v=line.strip()
-             if any(term in v.lower() for term in ('ssl_certificate','private','password','token','secret','uuid','key')): continue
-             if v: print(str(i)+': '+v[:160])
+            import pathlib,json,subprocess,re
+            root=pathlib.Path('/etc/myvps/xhttp-reality')
+            if not (root/'config.json').exists():print('new_config_present=no');raise SystemExit
+            cfg=json.loads((root/'config.json').read_text())
+            info=json.loads((root/'client-domain.json').read_text())
+            sec=[cfg['inbounds'][0]['settings']['clients'][0]['id'],cfg['inbounds'][0]['streamSettings']['xhttpSettings']['path'],cfg['inbounds'][0]['streamSettings']['realitySettings']['privateKey']]
+            p=subprocess.run(['journalctl','-u','myvps-xhttp-reality.service','--since','20 minutes ago','-o','cat','--no-pager'],capture_output=True,text=True,timeout=10)
+            items=p.stdout.splitlines()[-50:]
+            for x in items:
+             for v in sec:
+              if v:x=x.replace(v,'[redacted]')
+             x=re.sub(r'((?:\d{1,3}\.){3}\d{1,3})(?::\d+)?','[ip]',x)
+             if any(k in x.lower() for k in ('error','fail','warn','listen','start','tls','reality','xhttp','close','h2','mux')):print('server_log='+x[:200])
+            logs=sorted(pathlib.Path('/var/tmp').glob('myvps-xhttp-reality-probe.*/client.log'))
+            print('saved_client_logs='+str(len(logs)))
+            for f in logs[-2:]:
+             try:lines=f.read_text(errors='replace').splitlines()[-40:]
+             except OSError:continue
+             for line in lines:
+              for v in sec:
+               if v:line=line.replace(v,'[redacted]')
+              line=re.sub(r'((?:\d{1,3}\.){3}\d{1,3})(?::\d+)?','[ip]',line)
+              if any(k in line.lower() for k in ('error','fail','warn','tls','reality','xhttp','close','mux','fingerprint')):print('client_log='+line[:220])
             PY
-            echo '=== BEFORE ==='
-            for s in xray-racknerd-443 nginx; do echo "$s=$(systemctl is-active "$s")"; done
+            printf 'new_service_state='; systemctl is-active myvps-xhttp-reality.service || true
+            printf 'nginx_syntax='; nginx -t >/dev/null 2>&1 && echo PASS || echo FAIL
+            printf 'old_reality_state='; systemctl is-active xray-racknerd-443.service
+            echo '=== END ==='
