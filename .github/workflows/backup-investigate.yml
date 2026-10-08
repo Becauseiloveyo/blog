@@ -1,0 +1,91 @@
+name: Temporary VPS backup investigation
+on:
+  push:
+    branches:
+      - ops/read-only-vps-audit-20261008
+    paths:
+      - .github/workflows/backup-investigate.yml
+permissions:
+  contents: read
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Inspect backup schedules and rclone without revealing secrets
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: ${{ secrets.SERVER_USER }}
+          key: ${{ secrets.SERVER_SSH_KEY }}
+          port: ${{ secrets.SERVER_PORT || 22 }}
+          timeout: 35s
+          command_timeout: 190s
+          script_stop: false
+          script: |
+            set +e
+            export LC_ALL=C
+            echo '=== TIME AND CRON STATUS ==='
+            date -u '+utc=%Y-%m-%dT%H:%M:%SZ'
+            date '+server_local=%Y-%m-%dT%H:%M:%S%z'
+            printf 'timezone='; timedatectl show -p Timezone --value 2>/dev/null
+            printf 'cron_service='; systemctl is-active cron 2>/dev/null
+            echo '=== ROOT CRONTAB CLASSIFICATION ==='
+            python3 - <<'PY'
+            import subprocess,re
+            p=subprocess.run(['crontab','-l'],capture_output=True,text=True)
+            if p.returncode!=0: print('root_crontab=unavailable'); raise SystemExit
+            n=0
+            for line in p.stdout.splitlines():
+             s=line.strip()
+             if not s or s.startswith('#'): continue
+             n+=1
+             parts=s.split(None,5)
+             if len(parts)<6: print(f'cron_{n}=special_or_env');continue
+             sched=' '.join(parts[:5]);cmd=parts[5]
+             category='backup' if re.search(r'backup|rclone|rsync|restic|borg|tar|dump',cmd,re.I) else 'other'
+             markers=[x for x in ('rclone','backup','vps','blog','sh','python','bash','curl') if x in cmd.lower()]
+             print(f'cron_{n}_schedule={sched} type={category} markers={",".join(markers)}')
+            print('cron_active_count='+str(n))
+            PY
+            echo '=== SCHEDULED JOBS AND RECENT HISTORY ==='
+            for t in myvps-backup-vps.timer myvps-backup-blog.timer; do printf 'timer_%s=' "$t"; systemctl is-enabled "$t" 2>/dev/null || true; done
+            printf 'all_active_backup_timers='; systemctl list-timers --all --no-legend 2>/dev/null | grep -Ec 'backup|rclone|restic|borg' || true
+            printf 'cron_journal_events_7d='; journalctl -u cron --since '7 days ago' --no-pager 2>/dev/null | grep -Ec 'CMD|RELOAD|ERROR|failed|Failed' || true
+            printf 'cron_journal_backup_events_7d='; journalctl -u cron --since '7 days ago' --no-pager 2>/dev/null | grep -Eic 'backup|rclone|rsync|restic|borg' || true
+            echo '=== BACKUP SCRIPT INVENTORY ==='
+            python3 - <<'PY'
+            from pathlib import Path
+            for d in ('/root','/usr/local/bin','/opt'):
+             p=Path(d)
+             if not p.is_dir(): continue
+             try: files=[x for x in p.iterdir() if x.is_file() and ('backup' in x.name.lower() or 'vps' in x.name.lower())]
+             except PermissionError: files=[]
+             for f in sorted(files)[:16]:
+              st=f.stat()
+              print(f'candidate={d}/{f.name} modified_utc='+__import__('datetime').datetime.fromtimestamp(st.st_mtime,__import__('datetime').timezone.utc).isoformat())
+            PY
+            echo '=== RCLONE HEALTH (READ ONLY) ==='
+            if command -v rclone >/dev/null 2>&1; then
+             rclone version | head -1
+             printf 'remote_count='; rclone listremotes 2>/dev/null | wc -l
+             i=0
+             while IFS= read -r rem; do
+              i=$((i+1))
+              [ "$i" -le 3 ] || break
+              if timeout 16 rclone lsf --max-depth 1 "$rem" >/dev/null 2>&1; then echo "remote_${i}_root_list=OK"; else echo "remote_${i}_root_list=FAIL_OR_TIMEOUT"; fi
+             done < <(rclone listremotes 2>/dev/null)
+            fi
+            echo '=== LOCAL BACKUP ARTIFACTS ==='
+            python3 - <<'PY'
+            from pathlib import Path
+            from datetime import datetime,timezone
+            for folder in ['/root/blog-backups','/root/backups','/root/backup','/var/backups','/opt/backups']:
+             p=Path(folder)
+             if not p.exists():continue
+             try: files=sorted(p.iterdir(),key=lambda x:x.stat().st_mtime,reverse=True)
+             except Exception:files=[]
+             print(f'folder={folder} entries={len(files)}')
+             if files: print('most_recent_entry_utc='+datetime.fromtimestamp(files[0].stat().st_mtime,timezone.utc).isoformat())
+            PY
+            echo '=== END BACKUP INVENTORY ==='
