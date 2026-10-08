@@ -1,4 +1,4 @@
-name: Temporary XHTTP client configuration diagnostics
+name: Temporary XHTTP client root cause and CDN test
 on:
   push:
     branches:
@@ -8,37 +8,43 @@ on:
 permissions:
   contents: read
 jobs:
-  diag:
+  test:
     runs-on: ubuntu-latest
     timeout-minutes: 4
     steps:
-      - name: Diagnose client config with sensitive values redacted
+      - name: Diagnose origin settings and test CDN route
         uses: appleboy/ssh-action@v1.0.3
         with:
           host: ${{ secrets.SERVER_HOST }}
           username: ${{ secrets.SERVER_USER }}
           key: ${{ secrets.SERVER_SSH_KEY }}
           port: ${{ secrets.SERVER_PORT || 22 }}
-          timeout: 35s
+          timeout: 40s
           command_timeout: 120s
           script_stop: false
           script: |
             set +e
-            echo '=== SANITIZED XHTTP CLIENT VALIDATION ==='
+            echo '=== XHTTP CLIENT VALIDATION ERROR CLASS ==='
             python3 - <<'PY'
-            import subprocess,json,pathlib,re
-            root=pathlib.Path('/etc/myvps/xhttp')
-            info=json.loads((root/'client-info.json').read_text())
-            for mode in ('origin','cdn'):
-             f=root/('client-'+mode+'.json')
-             p=subprocess.run(['/usr/local/bin/xray','run','-test','-config',str(f)],capture_output=True,text=True,timeout=18)
-             t=p.stdout+'\n'+p.stderr
-             for secret in (info.get('uuid',''),info.get('path','')):
-              if secret:t=t.replace(secret,'[redacted]')
-             t=re.sub(r'(?i)(password|token|privatekey)\s*[:=]\s*\S+',r'\1=[redacted]',t)
-             print(f'client_{mode}_config_check='+('PASS' if p.returncode==0 else 'FAIL'))
-             if p.returncode!=0:
-              for line in t.splitlines()[-6:]: print('diagnostic='+line[:180])
+            import json,subprocess,pathlib
+            root=pathlib.Path('/etc/myvps/xhttp'); info=json.loads((root/'client-info.json').read_text())
+            p=subprocess.run(['/usr/local/bin/xray','run','-test','-config',str(root/'client-origin.json')],capture_output=True,text=True,timeout=12)
+            s=p.stdout+'\n'+p.stderr
+            for v in (info.get('uuid',''),info.get('path','')):
+             if v:s=s.replace(v,'[redacted]')
+            for part in s.split(' > '):
+             if 'Failed to start:' in part or 'failed to build' in part or 'not support' in part or 'is not allowed' in part:
+              print('config_error_part='+part.strip()[:350])
             PY
-            echo '=== SERVICE STILL ACTIVE ==='
-            for s in nginx xray-racknerd-443 xray-racknerd-cf-ws myvps-xhttp; do echo "$s=$(systemctl is-active "$s")"; done
+            echo '=== TEST CDN CLIENT ==='
+            /usr/local/bin/xray run -config /etc/myvps/xhttp/client-cdn.json >/var/tmp/myvps-xhttp-cdn-diagnostic.log 2>&1 &
+            pid=$!
+            sleep 2
+            if kill -0 "$pid" 2>/dev/null; then
+             out=$(curl -sS -4 --socks5-hostname 127.0.0.1:18082 --connect-timeout 10 --max-time 22 -o /dev/null -w '%{http_code}' https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null)
+             echo "cdn_http_code=$out"
+            else echo cdn_client=START_FAIL; fi
+            kill "$pid" 2>/dev/null || true
+            wait "$pid" 2>/dev/null || true
+            rm -f /var/tmp/myvps-xhttp-cdn-diagnostic.log
+            echo '=== END ==='
