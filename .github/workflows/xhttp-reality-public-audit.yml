@@ -1,0 +1,56 @@
+name: Temporary XHTTP REALITY domain routing audit
+on:
+  push:
+    branches:
+      - ops/read-only-vps-audit-20261008
+    paths:
+      - .github/workflows/xhttp-reality-public-audit.yml
+permissions:
+  contents: read
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Inspect 2b DNS versus VPS local and public addresses safely
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: ${{ secrets.SERVER_USER }}
+          key: ${{ secrets.SERVER_SSH_KEY }}
+          port: ${{ secrets.SERVER_PORT || 22 }}
+          timeout: 40s
+          command_timeout: 145s
+          script_stop: false
+          script: |
+            set +e
+            echo '=== XHTTP REALITY PUBLIC ADDRESS ROUTE CHECK ==='
+            python3 - <<'PY'
+            import socket,subprocess,ipaddress
+            hostname='2b.gooffu.tech'
+            v4=sorted({s[4][0] for s in socket.getaddrinfo(hostname,443,socket.AF_INET,socket.SOCK_STREAM)})
+            try:v6=sorted({s[4][0] for s in socket.getaddrinfo(hostname,443,socket.AF_INET6,socket.SOCK_STREAM)})
+            except socket.gaierror:v6=[]
+            p=subprocess.run(['ip','-j','-4','address','show'],capture_output=True,text=True)
+            import json
+            internal=set()
+            try:
+             for iface in json.loads(p.stdout):
+              for addr in iface.get('addr_info',[]): internal.add(addr.get('local',''))
+            except (ValueError,KeyError):pass
+            public=subprocess.run(['curl','-4','--noproxy','*','-sS','--connect-timeout','4','--max-time','9','https://api.ipify.org'],capture_output=True,text=True)
+            pub=public.stdout.strip() if public.returncode==0 else ''
+            print('reality_domain_ipv4_record_count='+str(len(v4)))
+            print('reality_domain_ipv6_record_count='+str(len(v6)))
+            print('reality_domain_ipv4_matches_interface='+str(bool(set(v4)&internal)))
+            print('reality_domain_ipv4_matches_public_egress='+str(bool(pub and pub in v4)))
+            print('reality_domain_ips_private='+str(any(ipaddress.ip_address(x).is_private for x in v4)))
+            print('public_address_egress_probe='+('PASS' if pub else 'FAIL'))
+            for i,ip in enumerate(v4,1):
+             try:
+              s=socket.create_connection((ip,443),timeout=5);s.close();print('dns_a_'+str(i)+'_tcp443=OPEN')
+             except OSError:print('dns_a_'+str(i)+'_tcp443=FAILED')
+            PY
+            for service in nginx xray-racknerd-443 myvps-xhttp-reality; do printf 'service_%s=' "$service"; systemctl is-active "$service"; done
+            printf 'nginx_syntax='; nginx -t >/dev/null 2>&1 && echo PASS || echo FAIL
+            echo '=== END CHECK ==='
