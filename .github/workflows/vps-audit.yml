@@ -46,8 +46,9 @@ jobs:
           port: ${{ secrets.SERVER_PORT || 22 }}
           timeout: 35s
           command_timeout: 100s
-          script_stop: true
+          script_stop: false
           script: |
+            set +e
             set -u
             export LC_ALL=C
             echo '=== VPS read-only audit ==='
