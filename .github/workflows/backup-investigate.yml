@@ -1,4 +1,4 @@
-name: Temporary VPS backup investigation
+name: VPS backup root cause followup
 on:
   push:
     branches:
@@ -12,7 +12,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - name: Inspect backup schedules and rclone without revealing secrets
+      - name: Inspect cron script identities and cloud backup paths without secrets
         uses: appleboy/ssh-action@v1.0.3
         with:
           host: ${{ secrets.SERVER_HOST }}
@@ -20,72 +20,62 @@ jobs:
           key: ${{ secrets.SERVER_SSH_KEY }}
           port: ${{ secrets.SERVER_PORT || 22 }}
           timeout: 35s
-          command_timeout: 190s
+          command_timeout: 230s
           script_stop: false
           script: |
             set +e
             export LC_ALL=C
-            echo '=== TIME AND CRON STATUS ==='
-            date -u '+utc=%Y-%m-%dT%H:%M:%SZ'
-            date '+server_local=%Y-%m-%dT%H:%M:%S%z'
-            printf 'timezone='; timedatectl show -p Timezone --value 2>/dev/null
-            printf 'cron_service='; systemctl is-active cron 2>/dev/null
-            echo '=== ROOT CRONTAB CLASSIFICATION ==='
+            echo '=== CRON EXECUTABLES ==='
             python3 - <<'PY'
-            import subprocess,re
+            import subprocess,shlex,os
             p=subprocess.run(['crontab','-l'],capture_output=True,text=True)
-            if p.returncode!=0: print('root_crontab=unavailable'); raise SystemExit
-            n=0
-            for line in p.stdout.splitlines():
-             s=line.strip()
-             if not s or s.startswith('#'): continue
-             n+=1
-             parts=s.split(None,5)
-             if len(parts)<6: print(f'cron_{n}=special_or_env');continue
-             sched=' '.join(parts[:5]);cmd=parts[5]
-             category='backup' if re.search(r'backup|rclone|rsync|restic|borg|tar|dump',cmd,re.I) else 'other'
-             markers=[x for x in ('rclone','backup','vps','blog','sh','python','bash','curl') if x in cmd.lower()]
-             print(f'cron_{n}_schedule={sched} type={category} markers={",".join(markers)}')
-            print('cron_active_count='+str(n))
+            for i,line in enumerate((v.strip() for v in p.stdout.splitlines() if v.strip() and not v.lstrip().startswith('#')),1):
+             parts=line.split(None,5)
+             if len(parts)<6:continue
+             s=parts[5]
+             try:t=shlex.split(s)
+             except ValueError:t=s.split()
+             exe=os.path.basename(t[0]) if t else 'none'
+             program=os.path.basename(t[1]) if len(t)>1 and exe in ('bash','sh','python','python3','/bin/sh') else 'none'
+             print(f'cron_{i}_command={exe} script_basename={program}')
             PY
-            echo '=== SCHEDULED JOBS AND RECENT HISTORY ==='
-            for t in myvps-backup-vps.timer myvps-backup-blog.timer; do printf 'timer_%s=' "$t"; systemctl is-enabled "$t" 2>/dev/null || true; done
-            printf 'all_active_backup_timers='; systemctl list-timers --all --no-legend 2>/dev/null | grep -Ec 'backup|rclone|restic|borg' || true
-            printf 'cron_journal_events_7d='; journalctl -u cron --since '7 days ago' --no-pager 2>/dev/null | grep -Ec 'CMD|RELOAD|ERROR|failed|Failed' || true
-            printf 'cron_journal_backup_events_7d='; journalctl -u cron --since '7 days ago' --no-pager 2>/dev/null | grep -Eic 'backup|rclone|rsync|restic|borg' || true
-            echo '=== BACKUP SCRIPT INVENTORY ==='
+            echo '=== RCLONE BACKEND TYPES (NO CONFIG DUMP) ==='
+            python3 - <<'PY'
+            import configparser,subprocess
+            p=subprocess.run(['rclone','config','file'],text=True,capture_output=True)
+            lines=[s.strip() for s in p.stdout.splitlines() if s.strip()]
+            path=next((s for s in reversed(lines) if s.startswith('/')),None)
+            if path:
+             c=configparser.ConfigParser(interpolation=None); c.read(path)
+             for i,name in enumerate(c.sections(),1):
+              print('remote_'+str(i)+'_backend='+c[name].get('type','unknown'))
+            else:print('remote_backend_info=unavailable')
+            PY
+            echo '=== CLOUD BACKUP PATH PROBES ==='
+            i=0
+            while IFS= read -r remote; do
+             i=$((i+1)); [ "$i" -le 3 ] || break
+             for p in 'VPS-Backups/racknerd/full' 'VPS-Backups/racknerd/blog' 'VPS-Backups' 'backup' 'backups'; do
+              if timeout 7 rclone lsf --max-depth 1 "$remote$p" >/dev/null 2>&1; then echo "remote_${i}_path_${p//\//_}=ACCESSIBLE"; else echo "remote_${i}_path_${p//\//_}=NOT_ACCESSIBLE_OR_MISSING"; fi
+             done
+            done < <(rclone listremotes 2>/dev/null)
+            echo '=== SYSTEM CRON BACKUP JOB CLASSIFICATION ==='
             python3 - <<'PY'
             from pathlib import Path
-            for d in ('/root','/usr/local/bin','/opt'):
-             p=Path(d)
-             if not p.is_dir(): continue
-             try: files=[x for x in p.iterdir() if x.is_file() and ('backup' in x.name.lower() or 'vps' in x.name.lower())]
-             except PermissionError: files=[]
-             for f in sorted(files)[:16]:
-              st=f.stat()
-              print(f'candidate={d}/{f.name} modified_utc='+__import__('datetime').datetime.fromtimestamp(st.st_mtime,__import__('datetime').timezone.utc).isoformat())
+            for base in ('/etc/cron.d','/etc/cron.daily','/etc/cron.weekly','/etc/systemd/system'):
+             p=Path(base)
+             if not p.is_dir():continue
+             found=[]
+             for f in p.iterdir():
+              if not f.is_file():continue
+              if 'backup' in f.name.lower() or 'rclone' in f.name.lower(): found.append(f.name)
+             print('location='+base+' related_job_count='+str(len(found)))
+             for x in found[:10]:print(' related_job_name='+x)
             PY
-            echo '=== RCLONE HEALTH (READ ONLY) ==='
-            if command -v rclone >/dev/null 2>&1; then
-             rclone version | head -1
-             printf 'remote_count='; rclone listremotes 2>/dev/null | wc -l
-             i=0
-             while IFS= read -r rem; do
-              i=$((i+1))
-              [ "$i" -le 3 ] || break
-              if timeout 16 rclone lsf --max-depth 1 "$rem" >/dev/null 2>&1; then echo "remote_${i}_root_list=OK"; else echo "remote_${i}_root_list=FAIL_OR_TIMEOUT"; fi
-             done < <(rclone listremotes 2>/dev/null)
-            fi
-            echo '=== LOCAL BACKUP ARTIFACTS ==='
-            python3 - <<'PY'
-            from pathlib import Path
-            from datetime import datetime,timezone
-            for folder in ['/root/blog-backups','/root/backups','/root/backup','/var/backups','/opt/backups']:
-             p=Path(folder)
-             if not p.exists():continue
-             try: files=sorted(p.iterdir(),key=lambda x:x.stat().st_mtime,reverse=True)
-             except Exception:files=[]
-             print(f'folder={folder} entries={len(files)}')
-             if files: print('most_recent_entry_utc='+datetime.fromtimestamp(files[0].stat().st_mtime,timezone.utc).isoformat())
-            PY
-            echo '=== END BACKUP INVENTORY ==='
+            echo '=== CRON JOURNAL LATEST EVIDENCE ==='
+            for label in 24h 7d; do
+             duration='1 day ago'; [ "$label" = '7d' ] && duration='7 days ago'
+             printf 'cron_cmd_count_%s=' "$label"
+             journalctl -u cron --since "$duration" -o cat --no-pager 2>/dev/null | grep -c '(CRON) info (No MTA installed, discarding output)' || true
+            done
+            echo '=== FINISHED ==='
