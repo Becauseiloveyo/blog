@@ -1,0 +1,48 @@
+name: Temporary XHTTP topology preflight
+on:
+  push:
+    branches:
+      - ops/read-only-vps-audit-20261008
+    paths:
+      - .github/workflows/xhttp-preflight.yml
+permissions:
+  contents: read
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Read-only Xray/nginx topology and local SNI routes
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: ${{ secrets.SERVER_USER }}
+          key: ${{ secrets.SERVER_SSH_KEY }}
+          port: ${{ secrets.SERVER_PORT || 22 }}
+          timeout: 35s
+          command_timeout: 160s
+          script_stop: false
+          script: |
+            set +e
+            echo '=== CURRENT XRAY AND NETWORK ==='
+            for s in nginx xray-racknerd-443 cron; do printf 'service_%s=' "$s"; systemctl is-active "$s" 2>/dev/null; done
+            printf 'xray_version='; /usr/local/bin/xray version 2>/dev/null | head -1
+            printf 'nginx_syntax='; nginx -t >/dev/null 2>&1 && echo PASS || echo FAIL
+            for port in 80 443 3000 8443 2053 15593 15594 18080 18081 18082; do printf 'tcp_%s=' "$port"; ss -H -lnt 2>/dev/null | awk '{print $4}' | grep -Ec ":$port$" || true; done
+            echo '=== STREAM ROUTING (DOMAIN + LOCAL PORT ONLY) ==='
+            nginx -T 2>/dev/null | python3 -c 'import sys,re; t=sys.stdin.read(); print("nginx_stream_blocks="+str(len(re.findall(r"(?m)^\s*stream\s*\{",t))));print("nginx_http_blocks="+str(len(re.findall(r"(?m)^\s*http\s*\{",t)))); names=re.findall(r"(?m)^\s*server_name\s+([^;]+);",t);print("http_server_names="+",".join(names[:20])); print("listen_entries="+",".join(re.findall(r"(?m)^\s*listen\s+([^;]+);",t)[:30])); print("nginx_conf_files="+str(len(re.findall(r"configuration file",t))))'
+            echo '=== HTTPS DOMAINS (LOCAL ORIGIN) ==='
+            for host in cf.gooffu.tech blog.gooffu.tech; do
+             code=$(curl --noproxy '*' -sS --connect-timeout 5 --max-time 10 --resolve "$host:443:127.0.0.1" -k -o /dev/null -w '%{http_code}|%{http_version}|%{remote_port}' "https://$host/" 2>/dev/null)
+             echo "localhost_sni_${host}=$code"
+            done
+            echo '=== XRAY AND CF WS TOPOLOGY ==='
+            for f in /etc/xray-racknerd-443/config.json /etc/xray-racknerd-cf/config.json /etc/xray-cf-ws/config.json /usr/local/etc/xray/config.json; do
+             if [ -r "$f" ]; then
+              case "$f" in */xray-racknerd-443/*) k=reality;; *cf*) k=cfws;; *) k=other;; esac
+              jq -r --arg k "$k" '"in_"+$k+"="+([.inbounds[]? | (.protocol//"-")+"/"+(.streamSettings.network//"-")+"/"+(.streamSettings.security//"-")+"/"+((.port//0)|tostring)]|join(",")),"out_"+$k+"="+([.outbounds[]?|(.tag//"-")+"="+(.protocol//"-")]|join(","))' "$f" 2>/dev/null || true
+             fi
+            done
+            printf 'systemd_xray_related='; systemctl list-units --all --type=service --no-legend 2>/dev/null | awk 'tolower($1)~/xray/ {print $1}' | tr '\n' ','; echo
+            printf 'disk_free_mb='; df -Pm / | awk 'NR==2{print $4}'
+            echo '=== DONE ==='
