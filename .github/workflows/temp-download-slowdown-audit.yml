@@ -1,4 +1,4 @@
-name: Temporary download slowdown VPS audit
+name: Temporary TCP port aggregation audit
 on:
   push:
     branches:
@@ -10,71 +10,45 @@ permissions:
 jobs:
   audit:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 4
     steps:
-      - name: Read only system and proxy route performance sample
+      - name: Aggregate established TCP connections without printing IPs
         uses: appleboy/ssh-action@v1.0.3
         with:
           host: ${{ secrets.SERVER_HOST }}
           username: ${{ secrets.SERVER_USER }}
           key: ${{ secrets.SERVER_SSH_KEY }}
           port: ${{ secrets.SERVER_PORT || 22 }}
-          timeout: 40s
-          command_timeout: 160s
+          timeout: 35s
+          command_timeout: 100s
           script_stop: false
           script: |
             set +e
-            echo '=== READ ONLY VPS SPEED AUDIT ==='
-            printf 'utc_time='; date -u +%FT%TZ
-            printf 'uptime='; uptime -p
-            printf 'loadavg='; cat /proc/loadavg | cut -d ' ' -f1-3
-            printf 'memory='; free -m | awk '/^Mem:/{printf "total=%s used=%s available=%s",$2,$3,$7} /Swap:/{printf " swap_used=%s swap_total=%s\n",$3,$2}'
-            printf 'disk='; df -h / | awk 'NR==2{print $5 " used; " $4 " free"}'
-            printf 'cpu_threads='; nproc
-            printf 'failed_services='; systemctl --failed --no-legend | wc -l
-            for unit in nginx xray-racknerd-443 xray-racknerd-cf-ws myvps-xhttp myvps-xhttp-reality myvps-backup-watch.timer; do printf 'service_%s=' "$unit"; systemctl is-active "$unit" 2>/dev/null || true; done
-            echo '=== XRAY EGRESS MODES (NO CREDENTIALS) ==='
+            echo '=== TCP CONNECTION BREAKDOWN READ ONLY ==='
             python3 - <<'PY'
-            import pathlib,json
-            files={'old_reality':'/etc/xray-racknerd-443/config.json','cdn_xhttp':'/etc/myvps/xhttp/config.json','reality_xhttp':'/etc/myvps/xhttp-reality/config.json'}
-            for label,path in files.items():
-             try: c=json.loads(pathlib.Path(path).read_text())
-             except Exception: print(label+'_config=missing');continue
-             inbound=c.get('inbounds',[{}])[0]; stream=inbound.get('streamSettings',{})
-             outs=c.get('outbounds',[])
-             print(label+'_network='+str(stream.get('network','tcp')))
-             print(label+'_security='+str(stream.get('security','none')))
-             print(label+'_xhttp_mode='+str(stream.get('xhttpSettings',{}).get('mode','n/a')))
-             print(label+'_first_outbound='+str(outs[0].get('protocol') if outs else 'none'))
-             print(label+'_outbounds='+','.join(o.get('protocol','unknown') for o in outs))
-             print(label+'_routing_targets='+','.join(str(r.get('outboundTag','none')) for r in c.get('routing',{}).get('rules',[])))
-            PY
-            echo '=== NETWORK SHAPING / SOCKET COUNTS ==='
-            printf 'eth0_qdisc='; tc qdisc show dev eth0 2>/dev/null | head -1 | cut -c 1-190
-            printf 'tcp_total='; ss -Htan | wc -l
-            printf 'tcp_established='; ss -Htan state established | wc -l
-            printf 'xray_memory_mb='; ps -C xray -o rss= | awk '{s+=$1;n++}END{printf "count=%d rss_sum=%.1f\n",n,s/1024}'
-            echo '=== SHORT SAMPLED CPU / NETWORK / RETRANSMISSION ==='
-            python3 - <<'PY'
+            from collections import Counter
             from pathlib import Path
-            import time
-            def cp():
-             x=Path('/proc/stat').read_text().splitlines()[0].split()[1:];a=list(map(int,x));return sum(a),a[3]+a[4]
-            def net():
-             base=Path('/sys/class/net/eth0/statistics')
-             return tuple(int((base/x).read_text()) for x in ('rx_bytes','tx_bytes'))
-            def retrans():
-             p=Path('/proc/net/snmp').read_text().splitlines()
-             for i,line in enumerate(p[:-1]):
-              if line.startswith('Tcp:') and p[i+1].startswith('Tcp:'):
-               keys=line.split()[1:];vals=p[i+1].split()[1:];return int(dict(zip(keys,vals)).get('RetransSegs',0))
-             return 0
-            t1,i1=cp(); n1=net();r1=retrans(); time.sleep(7); t2,i2=cp();n2=net();r2=retrans()
-            print('sample_cpu_busy_pct='+format(100*(1-(i2-i1)/max(1,t2-t1)),'.1f'))
-            print('sample_eth0_rx_mbps='+format((n2[0]-n1[0])*8/7e6,'.3f'))
-            print('sample_eth0_tx_mbps='+format((n2[1]-n1[1])*8/7e6,'.3f'))
-            print('sample_tcp_retransmitted_segments='+str(r2-r1))
+            import ipaddress
+            ss=Path('/proc/net/tcp').read_text().splitlines()[1:]
+            ss6=Path('/proc/net/tcp6').read_text().splitlines()[1:]
+            local=Counter();remote=Counter();state=Counter();peers=Counter();lport_active=Counter()
+            for line in ss+ss6:
+             a=line.split()
+             if len(a)<4:continue
+             st=a[3];state[st]+=1
+             if st!='01':continue
+             lp=int(a[1].split(':')[1],16); rp=int(a[2].split(':')[1],16)
+             local[lp]+=1;remote[rp]+=1
+             peers[a[2].split(':')[0]]+=1
+            for port,n in local.most_common(12):
+             p=str(port) if port in (80,443,3000,10443,24443,24444,18081,18084,22) else 'ephemeral'
+             lport_active[p]+=n
+            print('tcp_established_by_local_port='+str(dict(lport_active)))
+            print('tcp_established_by_remote_port='+str(remote.most_common(8)))
+            print('tcp_distinct_remote_address_count='+str(len(peers)))
+            print('tcp_max_connections_single_remote_address='+str(max(peers.values(),default=0)))
+            print('tcp_states_hex='+str(dict(state)))
             PY
-            echo '=== SERVICE RESTARTS AND RECENT ERRORS ==='
-            for unit in xray-racknerd-443 xray-racknerd-cf-ws myvps-xhttp myvps-xhttp-reality; do printf 'restarts_%s=' "$unit"; systemctl show "$unit" -p NRestarts --value 2>/dev/null; done
-            echo '=== AUDIT COMPLETE ==='
+            echo '=== NETDEV ERROR COUNTERS ==='
+            for c in rx_errors tx_errors rx_dropped tx_dropped; do printf '%s=' "$c"; cat "/sys/class/net/eth0/statistics/$c"; done
+            echo '=== END ==='
