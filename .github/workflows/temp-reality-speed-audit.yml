@@ -1,4 +1,4 @@
-name: Temporary REALITY routing and TCP diagnostics
+name: Temporary bounded download comparison
 on:
   push:
     branches:
@@ -12,57 +12,61 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - name: Diagnose REALITY route and congestion without disclosing users
+      - name: Compare bounded 20MB native vs chained SOCKS egress without logging secrets
         uses: appleboy/ssh-action@v1.0.3
         with:
           host: ${{ secrets.SERVER_HOST }}
           username: ${{ secrets.SERVER_USER }}
           key: ${{ secrets.SERVER_SSH_KEY }}
           port: ${{ secrets.SERVER_PORT || 22 }}
-          timeout: 35s
-          command_timeout: 120s
+          timeout: 40s
+          command_timeout: 180s
           script_stop: false
           script: |
             set -Eeuo pipefail
-            echo '=== ORIGINAL REALITY ROUTING AUDIT ==='
+            echo '=== SHORT BOUNDED VPS DIRECT VS RES SOCKS THROUGHPUT ==='
             python3 - <<'PY'
-            from pathlib import Path
-            import json
-            cfg=json.loads(Path('/etc/xray-racknerd-443/config.json').read_text())
-            inbs=[i for i in cfg.get('inbounds',[]) if i.get('protocol')=='vless']
-            outs=cfg.get('outbounds',[])
-            print('vless_inbound_count='+str(len(inbs)))
-            print('first_outbound_protocol='+str(outs[0].get('protocol') if outs else 'NONE'))
-            print('socks_outbound_count='+str(sum(o.get('protocol')=='socks' for o in outs)))
-            for j,ib in enumerate(inbs,1):
-             clients=ib.get('settings',{}).get('clients',[])
-             names={str(x.get('email','')) for x in clients if x.get('email')}
-             print(f'inbound_{j}_network='+str(ib.get('streamSettings',{}).get('network','tcp')))
-             print(f'inbound_{j}_client_count='+str(len(clients)))
-             print(f'inbound_{j}_clients_with_email='+str(len(names)))
-             print(f'inbound_{j}_vision_client_count='+str(sum(x.get('flow')=='xtls-rprx-vision' for x in clients)))
-             matched=set()
-             for k,r in enumerate(cfg.get('routing',{}).get('rules',[]),1):
-              users=set(map(str,r.get('user',[])))
-              socks=r.get('outboundTag') in {o.get('tag') for o in outs if o.get('protocol')=='socks'}
-              if socks: matched|=(names & users)
-              print(f'route_{k}_match_types='+','.join(x for x in ('user','inboundTag','domain','ip','port','network','protocol','source','attrs') if x in r))
-              print(f'route_{k}_outbound_is_socks='+str(socks))
-             print(f'inbound_{j}_client_email_matches_socks_rule='+str(len(matched)))
-             print(f'inbound_{j}_client_email_not_matching_socks_rule='+str(len(names-matched)))
+            import json, subprocess, time, os, pathlib, urllib.parse
+            cfg=json.loads(pathlib.Path('/etc/xray-racknerd-443/config.json').read_text())
+            so=[o for o in cfg.get('outbounds',[]) if o.get('protocol')=='socks' and o.get('tag')=='res-socks']
+            assert len(so)==1
+            servers=so[0].get('settings',{}).get('servers',[])
+            assert len(servers)==1
+            server=servers[0]
+            auth=server.get('users',[])
+            assert len(auth)<=1
+            opts=[]
+            if auth:
+             u=auth[0]
+             assert 'user' in u and 'pass' in u
+             opts=['--proxy-user',u['user']+':'+u['pass']]
+            proxy=server['address']+':'+str(server['port'])
+            tests=[('native_direct',None),('res_socks',proxy)]
+            url='https://speed.cloudflare.com/__down?bytes=20000000'
+            def retrans():
+             lines=pathlib.Path('/proc/net/snmp').read_text().splitlines()
+             for i,l in enumerate(lines[:-1]):
+              if l.startswith('Tcp:') and lines[i+1].startswith('Tcp:'):
+               m=dict(zip(l.split()[1:],lines[i+1].split()[1:]));return int(m.get('RetransSegs','0'))
+             return 0
+            for label,host in tests:
+             args=['curl','-4','-sS','--noproxy','*','--connect-timeout','9','--max-time','38','--output','/dev/null','--write-out','%{http_code}|%{size_download}|%{time_connect}|%{time_starttransfer}|%{time_total}|%{speed_download}',url]
+             if host:
+              args=[x for x in args if x not in ['--noproxy','*']]
+              args[1:1]=['--socks5-hostname',host]+opts
+             env={k:v for k,v in os.environ.items() if not k.upper().endswith('_PROXY')}
+             start=retrans()
+             try:
+              r=subprocess.run(args,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,text=True,timeout=45,env=env)
+              code,byte,conn,ttfb,seconds,speed=r.stdout.strip().split('|')
+              print(label+'_curl_exit='+str(r.returncode))
+              print(label+'_http_code='+code)
+              print(label+'_mb_downloaded='+format(float(byte)/1e6,'.2f'))
+              print(label+'_elapsed_sec='+format(float(seconds),'.2f'))
+              print(label+'_avg_mbps='+format(float(speed)*8/1e6,'.2f'))
+              print(label+'_ttfb_sec='+format(float(ttfb),'.2f'))
+             except Exception as e:print(label+'_test=ERROR_'+type(e).__name__)
+             end=retrans()
+             print(label+'_system_tcp_retrans_delta='+str(end-start))
             PY
-            echo '=== NETWORK TRANSPORT ==='
-            printf 'cc='; sysctl -n net.ipv4.tcp_congestion_control
-            printf 'mtu='; cat /sys/class/net/eth0/mtu
-            printf 'tcp_rmem='; sysctl -n net.ipv4.tcp_rmem
-            printf 'tcp_wmem='; sysctl -n net.ipv4.tcp_wmem
-            printf 'rtt_distribution_ms='; ss -tin state established | sed -n 's/.*rtt:\([0-9.]*\)\/\([0-9.]*\).*/\1/p' | awk 'NR<=350{a[NR]=$1} END{n=NR;if(n==0){print "none";exit} asort(a);printf "p50=%s p90=%s n=%d\n",a[int(n*.5)+1],a[int(n*.9)+1],n}' 2>/dev/null || echo unavailable
-            echo '=== COUNTER SNAPSHOT ==='
-            python3 - <<'PY'
-            from pathlib import Path
-            s=Path('/proc/net/snmp').read_text().splitlines()
-            for i,line in enumerate(s[:-1]):
-             if line.startswith('Tcp:') and s[i+1].startswith('Tcp:'):
-              d=dict(zip(line.split()[1:],s[i+1].split()[1:]));print('tcp_retrans_segments_cumulative='+d.get('RetransSegs','n/a')); print('tcp_out_segments_cumulative='+d.get('OutSegs','n/a'));break
-            PY
-            echo '=== DONE ==='
+            echo '=== NO SERVER CONFIGURATION CHANGED ==='
