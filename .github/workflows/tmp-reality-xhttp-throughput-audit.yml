@@ -1,0 +1,78 @@
+name: Temporary 2026-10-17 proxy throughput diagnosis
+on:
+  push:
+    branches:
+      - ops/read-only-vps-audit-20261008
+    paths:
+      - .github/workflows/tmp-reality-xhttp-throughput-audit.yml
+permissions:
+  contents: read
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 4
+    steps:
+      - name: Summarize current Xray routes and TCP errors without credentials
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: ${{ secrets.SERVER_USER }}
+          key: ${{ secrets.SERVER_SSH_KEY }}
+          port: ${{ secrets.SERVER_PORT || 22 }}
+          timeout: 40s
+          command_timeout: 130s
+          script_stop: false
+          script: |
+            set +e
+            echo '=== VPS OCT 17 REALITY/XHTTP DIAGNOSTIC (NO SECRETS) ==='
+            printf 'time_utc='; date -u +%FT%TZ
+            printf 'xray_version='; /usr/local/bin/xray version 2>/dev/null | head -1
+            printf 'cpu_threads='; nproc
+            printf 'memory_avail_mb='; free -m | awk '/^Mem:/{print $7}'
+            printf 'loadavg='; awk '{print $1, $2, $3}' /proc/loadavg
+            printf 'kernel_cc='; sysctl -n net.ipv4.tcp_congestion_control
+            printf 'eth0_mtu='; cat /sys/class/net/eth0/mtu
+            printf 'qdisc='; tc qdisc show dev eth0 2>/dev/null | cut -c1-130 | head -1
+            for n in nginx xray-racknerd-443 xray-racknerd-cf-ws myvps-xhttp myvps-xhttp-reality; do printf 'unit_%s=' "$n"; systemctl is-active "$n" 2>/dev/null; printf 'restarts_%s=' "$n"; systemctl show -p NRestarts --value "$n" 2>/dev/null; done
+            python3 - <<'PY'
+            from pathlib import Path
+            import json
+            configs={'original_reality':'/etc/xray-racknerd-443/config.json','xhttp_reality':'/etc/myvps/xhttp-reality/config.json','xhttp_cdn':'/etc/myvps/xhttp/config.json'}
+            for name,p in configs.items():
+             try: c=json.loads(Path(p).read_text())
+             except Exception:print(name+'_config=unavailable'); continue
+             inb=c.get('inbounds',[{}])[0]; ss=inb.get('streamSettings',{}); clients=inb.get('settings',{}).get('clients',[])
+             out=c.get('outbounds',[]); routing=c.get('routing',{}).get('rules',[])
+             print(name+'_network='+str(ss.get('network','none')))
+             print(name+'_security='+str(ss.get('security','none')))
+             print(name+'_xhttp_mode='+str(ss.get('xhttpSettings',{}).get('mode','na')))
+             print(name+'_client_flows='+','.join(sorted({str(x.get('flow','none')) for x in clients})))
+             print(name+'_client_count='+str(len(clients)))
+             print(name+'_outbound_protocols='+','.join(o.get('protocol','') for o in out))
+             print(name+'_routing_matchers='+','.join('+'.join(x for x in ('user','inboundTag','domain','ip','network','port') if x in r) for r in routing))
+             if name=='original_reality':
+              byusers={x.get('email','') for x in clients}
+              rulesocks={str(u) for r in routing if r.get('outboundTag')=='res-socks' for u in r.get('user',[])}
+              print('original_reality_clients_matching_socks='+str(len(byusers&rulesocks)))
+              print('original_reality_clients_not_matching_socks='+str(len(byusers-rulesocks)))
+            PY
+            echo '=== CONNECTION AND RETRANSMISSION SAMPLE ==='
+            python3 - <<'PY'
+            from pathlib import Path
+            import time
+            def sample():
+             lines=Path('/proc/net/snmp').read_text().splitlines();m={}
+             for i,l in enumerate(lines[:-1]):
+              if l.startswith('Tcp:') and lines[i+1].startswith('Tcp:'):m=dict(zip(l.split()[1:],lines[i+1].split()[1:]));break
+             rx=Path('/sys/class/net/eth0/statistics/rx_bytes');tx=Path('/sys/class/net/eth0/statistics/tx_bytes')
+             return int(m.get('RetransSegs',0)),int(m.get('OutSegs',0)),int(rx.read_text()),int(tx.read_text())
+            a=sample();time.sleep(5);b=sample()
+            print('sample_sec=5')
+            print('system_tcp_retrans_segments='+str(b[0]-a[0]))
+            print('system_tcp_out_segments='+str(b[1]-a[1]))
+            print('eth0_sample_rx_mbps='+format((b[2]-a[2])*8/5e6,'.2f'))
+            print('eth0_sample_tx_mbps='+format((b[3]-a[3])*8/5e6,'.2f'))
+            PY
+            printf 'established='; ss -Htan state established 2>/dev/null | wc -l
+            printf 'failed_services='; systemctl --failed --no-legend | wc -l
+            echo '=== NO CONFIG MUTATIONS ==='
