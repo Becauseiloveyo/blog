@@ -23,7 +23,7 @@ jobs:
           command_timeout: 240s
           script_stop: false
           script: |
-            set +e
+            set -Eeuo pipefail
             umask 077
             echo '=== SERVER LOOPBACK RAW REALITY VS XHTTP REALITY COMPARISON ==='
             printf 'failed_systemd_units='; systemctl --failed --no-legend --plain | awk '{print $1}' | paste -sd ',' -
@@ -44,7 +44,7 @@ jobs:
             for line in keys.stdout.splitlines():
              if ':' in line:
               k,v=line.split(':',1)
-              if k.lower().strip() in ('password','public key'): pub=v.strip()
+              if k.lower().strip().startswith(('password','public')): pub=v.strip()
             assert len(pub)>35
             sni=sec['serverNames'][0]
             raw={'log':{'loglevel':'warning'},'inbounds':[{'tag':'localtest','listen':'127.0.0.1','port':18085,'protocol':'socks','settings':{'auth':'noauth','udp':False}}],'outbounds':[{'tag':'rawtest','protocol':'vless','settings':{'vnext':[{'address':'127.0.0.1','port':443,'users':[{'id':clients[0]['id'],'encryption':'none','flow':'xtls-rprx-vision'}]}]},'streamSettings':{'network':'tcp','security':'reality','realitySettings':{'serverName':sni,'fingerprint':'chrome','password':pub,'shortId':next((x for x in sec.get('shortIds',[]) if x),''),'spiderX':'/'}}}]}
