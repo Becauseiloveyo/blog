@@ -1,4 +1,4 @@
-name: Temporary 2026-10-17 proxy throughput diagnosis
+name: Temporary same-exit loopback REALITY speed comparison
 on:
   push:
     branches:
@@ -10,9 +10,9 @@ permissions:
 jobs:
   audit:
     runs-on: ubuntu-latest
-    timeout-minutes: 4
+    timeout-minutes: 6
     steps:
-      - name: Summarize current Xray routes and TCP errors without credentials
+      - name: Compare RAW/Vision and XHTTP/REALITY over localhost and same VPS egress
         uses: appleboy/ssh-action@v1.0.3
         with:
           host: ${{ secrets.SERVER_HOST }}
@@ -20,59 +20,62 @@ jobs:
           key: ${{ secrets.SERVER_SSH_KEY }}
           port: ${{ secrets.SERVER_PORT || 22 }}
           timeout: 40s
-          command_timeout: 130s
+          command_timeout: 240s
           script_stop: false
           script: |
             set +e
-            echo '=== VPS OCT 17 REALITY/XHTTP DIAGNOSTIC (NO SECRETS) ==='
-            printf 'time_utc='; date -u +%FT%TZ
-            printf 'xray_version='; /usr/local/bin/xray version 2>/dev/null | head -1
-            printf 'cpu_threads='; nproc
-            printf 'memory_avail_mb='; free -m | awk '/^Mem:/{print $7}'
-            printf 'loadavg='; awk '{print $1, $2, $3}' /proc/loadavg
-            printf 'kernel_cc='; sysctl -n net.ipv4.tcp_congestion_control
-            printf 'eth0_mtu='; cat /sys/class/net/eth0/mtu
-            printf 'qdisc='; tc qdisc show dev eth0 2>/dev/null | cut -c1-130 | head -1
-            for n in nginx xray-racknerd-443 xray-racknerd-cf-ws myvps-xhttp myvps-xhttp-reality; do printf 'unit_%s=' "$n"; systemctl is-active "$n" 2>/dev/null; printf 'restarts_%s=' "$n"; systemctl show -p NRestarts --value "$n" 2>/dev/null; done
-            python3 - <<'PY'
-            from pathlib import Path
-            import json
-            configs={'original_reality':'/etc/xray-racknerd-443/config.json','xhttp_reality':'/etc/myvps/xhttp-reality/config.json','xhttp_cdn':'/etc/myvps/xhttp/config.json'}
-            for name,p in configs.items():
-             try: c=json.loads(Path(p).read_text())
-             except Exception:print(name+'_config=unavailable'); continue
-             inb=c.get('inbounds',[{}])[0]; ss=inb.get('streamSettings',{}); clients=inb.get('settings',{}).get('clients',[])
-             out=c.get('outbounds',[]); routing=c.get('routing',{}).get('rules',[])
-             print(name+'_network='+str(ss.get('network','none')))
-             print(name+'_security='+str(ss.get('security','none')))
-             print(name+'_xhttp_mode='+str(ss.get('xhttpSettings',{}).get('mode','na')))
-             print(name+'_client_flows='+','.join(sorted({str(x.get('flow','none')) for x in clients})))
-             print(name+'_client_count='+str(len(clients)))
-             print(name+'_outbound_protocols='+','.join(o.get('protocol','') for o in out))
-             print(name+'_routing_matchers='+','.join('+'.join(x for x in ('user','inboundTag','domain','ip','network','port') if x in r) for r in routing))
-             if name=='original_reality':
-              byusers={x.get('email','') for x in clients}
-              rulesocks={str(u) for r in routing if r.get('outboundTag')=='res-socks' for u in r.get('user',[])}
-              print('original_reality_clients_matching_socks='+str(len(byusers&rulesocks)))
-              print('original_reality_clients_not_matching_socks='+str(len(byusers-rulesocks)))
+            umask 077
+            echo '=== SERVER LOOPBACK RAW REALITY VS XHTTP REALITY COMPARISON ==='
+            printf 'failed_systemd_units='; systemctl --failed --no-legend --plain | awk '{print $1}' | paste -sd ',' -
+            tempdir=$(mktemp -d /var/tmp/myvps-perf-compare.XXXXXXXX)
+            rawpid='';xpid=''
+            cleanup() { if [ -n "$rawpid" ]; then kill "$rawpid" >/dev/null 2>&1; wait "$rawpid" >/dev/null 2>&1; fi; if [ -n "$xpid" ]; then kill "$xpid" >/dev/null 2>&1; wait "$xpid" >/dev/null 2>&1; fi; rm -rf "$tempdir"; }
+            trap cleanup EXIT
+            python3 - "$tempdir" <<'PY'
+            import json,pathlib,subprocess,sys
+            d=pathlib.Path(sys.argv[1]);s=json.loads(pathlib.Path('/etc/xray-racknerd-443/config.json').read_text())
+            i=s['inbounds'][0];sec=i['streamSettings']['realitySettings']
+            match={str(u) for r in s.get('routing',{}).get('rules',[]) if r.get('outboundTag')=='res-socks' for u in r.get('user',[])}
+            clients=[c for c in i['settings']['clients'] if c.get('email') not in match]
+            assert len(clients)==1 and clients[0].get('flow')=='xtls-rprx-vision'
+            keys=subprocess.run(['/usr/local/bin/xray','x25519','-i',sec['privateKey']],capture_output=True,text=True,timeout=10)
+            assert keys.returncode==0
+            pub=''
+            for line in keys.stdout.splitlines():
+             if ':' in line:
+              k,v=line.split(':',1)
+              if k.lower().strip() in ('password','public key'): pub=v.strip()
+            assert len(pub)>35
+            sni=sec['serverNames'][0]
+            raw={'log':{'loglevel':'warning'},'inbounds':[{'tag':'localtest','listen':'127.0.0.1','port':18085,'protocol':'socks','settings':{'auth':'noauth','udp':False}}],'outbounds':[{'tag':'rawtest','protocol':'vless','settings':{'vnext':[{'address':'127.0.0.1','port':443,'users':[{'id':clients[0]['id'],'encryption':'none','flow':'xtls-rprx-vision'}]}]},'streamSettings':{'network':'tcp','security':'reality','realitySettings':{'serverName':sni,'fingerprint':'chrome','password':pub,'shortId':next((x for x in sec.get('shortIds',[]) if x),''),'spiderX':'/'}}}]}
+            f=d/'raw.json';f.write_text(json.dumps(raw));f.chmod(0o600)
+            c=json.loads(pathlib.Path('/etc/myvps/xhttp-reality/client-test.json').read_text());
+            assert c['outbounds'][0]['settings']['vnext'][0]['address']=='127.0.0.1'
+            assert c['outbounds'][0]['settings']['vnext'][0]['port']==443
+            assert c['inbounds'][0]['port']==18084
+            print('original_reality_direct_identity_selected=yes')
+            print('both_tests_same_vps_native_egress=yes')
             PY
-            echo '=== CONNECTION AND RETRANSMISSION SAMPLE ==='
-            python3 - <<'PY'
-            from pathlib import Path
-            import time
-            def sample():
-             lines=Path('/proc/net/snmp').read_text().splitlines();m={}
-             for i,l in enumerate(lines[:-1]):
-              if l.startswith('Tcp:') and lines[i+1].startswith('Tcp:'):m=dict(zip(l.split()[1:],lines[i+1].split()[1:]));break
-             rx=Path('/sys/class/net/eth0/statistics/rx_bytes');tx=Path('/sys/class/net/eth0/statistics/tx_bytes')
-             return int(m.get('RetransSegs',0)),int(m.get('OutSegs',0)),int(rx.read_text()),int(tx.read_text())
-            a=sample();time.sleep(5);b=sample()
-            print('sample_sec=5')
-            print('system_tcp_retrans_segments='+str(b[0]-a[0]))
-            print('system_tcp_out_segments='+str(b[1]-a[1]))
-            print('eth0_sample_rx_mbps='+format((b[2]-a[2])*8/5e6,'.2f'))
-            print('eth0_sample_tx_mbps='+format((b[3]-a[3])*8/5e6,'.2f'))
+            /usr/local/bin/xray run -test -config "$tempdir/raw.json" >/dev/null 2>&1; echo "raw_client_config_check=$?"
+            /usr/local/bin/xray run -test -config /etc/myvps/xhttp-reality/client-test.json >/dev/null 2>&1; echo "xhttp_client_config_check=$?"
+            /usr/local/bin/xray run -config "$tempdir/raw.json" >"$tempdir/raw.log" 2>&1 & rawpid=$!
+            /usr/local/bin/xray run -config /etc/myvps/xhttp-reality/client-test.json >"$tempdir/xhttp.log" 2>&1 & xpid=$!
+            sleep 2
+            for entry in 'raw:18085' 'xhttp:18084'; do
+             label=${entry%%:*}; port=${entry#*:}
+             result=$(env -u HTTPS_PROXY -u HTTP_PROXY -u ALL_PROXY -u https_proxy -u http_proxy -u all_proxy curl -4 -sS --connect-timeout 9 --max-time 38 --socks5-hostname 127.0.0.1:$port -o /dev/null -w '%{http_code} %{size_download} %{time_total} %{speed_download}' 'https://speed.cloudflare.com/__down?bytes=20000000' 2>/dev/null)
+             code=$?
+             python3 - "$label" "$code" "$result" <<'PY'
+            import sys
+            label,exit_code,stats=sys.argv[1:]
+            try:
+             http,size,sec,speed=stats.split()
+             print(f'{label}_curl_exit={exit_code}')
+             print(f'{label}_http={http}')
+             print(f'{label}_received_mb={float(size)/1e6:.2f}')
+             print(f'{label}_seconds={float(sec):.3f}')
+             print(f'{label}_mbps={float(speed)*8/1e6:.2f}')
+            except Exception:print(label+'_test=NOT_COMPLETED')
             PY
-            printf 'established='; ss -Htan state established 2>/dev/null | wc -l
-            printf 'failed_services='; systemctl --failed --no-legend | wc -l
-            echo '=== NO CONFIG MUTATIONS ==='
+            done
+            echo '=== NO PRODUCTION CONFIGURATION CHANGED ==='
