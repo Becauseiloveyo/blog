@@ -1,0 +1,30 @@
+name: Temporary proxy availability status check
+on:
+  push:
+    branches:
+      - ops/read-only-vps-audit-20261008
+    paths:
+      - .github/workflows/tmp-proxy-health.yml
+permissions:
+  contents: read
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 4
+    steps:
+      - name: Run existing redacted proxy chain check
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: ${{ secrets.SERVER_USER }}
+          key: ${{ secrets.SERVER_SSH_KEY }}
+          port: ${{ secrets.SERVER_PORT || 22 }}
+          command_timeout: 120s
+          script_stop: false
+          script: |
+            echo '=== SOCKS CHAIN LIVE HEALTH ==='
+            /usr/local/bin/myvps-next chain-test
+            echo '=== XRAY SERVICE ==='
+            systemctl is-active xray-racknerd-443
+            echo '=== SERVER CONFIG TEST ==='
+            /usr/local/bin/xray run -test -config /etc/xray-racknerd-443/config.json >/dev/null 2>&1 && echo PASS || echo FAIL
