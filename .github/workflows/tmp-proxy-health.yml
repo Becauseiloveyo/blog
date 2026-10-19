@@ -1,4 +1,4 @@
-name: Temporary SOCKS transport stage check
+name: Temporary SOCKS IPv4 health comparison
 on:
   push:
     branches:
@@ -12,43 +12,42 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 4
     steps:
-      - name: Check upstream DNS TCP and SOCKS5 method without credentials
+      - name: Compare upstream IPv4 and IPv6 TCP with general VPS HTTPS egress
         uses: appleboy/ssh-action@v1.0.3
         with:
           host: ${{ secrets.SERVER_HOST }}
           username: ${{ secrets.SERVER_USER }}
           key: ${{ secrets.SERVER_SSH_KEY }}
           port: ${{ secrets.SERVER_PORT || 22 }}
-          command_timeout: 110s
+          command_timeout: 120s
           script_stop: false
           script: |
             set +e
-            echo '=== SOCKS5 UPSTREAM TRANSPORT STAGES ==='
+            echo '=== RES SOCKS IPV4 AND GENERAL EGRESS COMPARISON ==='
             python3 - <<'PY'
             import socket,json,pathlib,time
-            cfg=json.loads(pathlib.Path('/etc/xray-racknerd-443/config.json').read_text())
-            ss=[s for o in cfg.get('outbounds',[]) if o.get('tag')=='res-socks' and o.get('protocol')=='socks' for s in o.get('settings',{}).get('servers',[])]
-            if len(ss)!=1: print('upstream_config=INVALID');raise SystemExit(0)
-            x=ss[0]
-            host=x.get('address');port=x.get('port')
-            for attempt in [1,2]:
-             sock=None
+            j=json.loads(pathlib.Path('/etc/xray-racknerd-443/config.json').read_text())
+            servers=[s for o in j.get('outbounds',[]) if o.get('tag')=='res-socks' for s in o.get('settings',{}).get('servers',[])]
+            if len(servers)!=1:print('server_config=UNEXPECTED');raise SystemExit(0)
+            s=servers[0];host=s.get('address');port=int(s.get('port'))
+            for fam,label in ((socket.AF_INET,'ipv4'),(socket.AF_INET6,'ipv6')):
              try:
-              a=socket.getaddrinfo(host,int(port),type=socket.SOCK_STREAM)
-              print('attempt_'+str(attempt)+'_dns=PASS')
-              t=time.monotonic()
-              sock=socket.create_connection((host,int(port)),timeout=8)
-              sock.settimeout(8)
-              print('attempt_'+str(attempt)+'_tcp=PASS duration_ms='+str(round(1000*(time.monotonic()-t))))
-              methods=bytes([0x05,0x02,0x00,0x02])
-              sock.sendall(methods)
-              response=sock.recv(2)
-              print('attempt_'+str(attempt)+'_socks5_method='+({b'\x05\x02':'PASSWORD_AUTH_REQUIRED',b'\x05\x00':'NO_AUTH',b'\x05\xff':'NO_ACCEPTABLE_AUTH'}.get(response,'INVALID_OR_CLOSED')))
-             except socket.gaierror: print('attempt_'+str(attempt)+'_dns=FAIL')
-             except (ConnectionError,TimeoutError,OSError) as e: print('attempt_'+str(attempt)+'_transport_failure='+type(e).__name__)
-             finally:
-              if sock:sock.close()
+              addrs=socket.getaddrinfo(host,port,fam,socket.SOCK_STREAM)
+              print('proxy_'+label+'_record_count='+str(len(set(a[4][0] for a in addrs))))
+              if not addrs:continue
+              sk=None
+              try:
+               t=time.monotonic()
+               sk=socket.socket(fam,socket.SOCK_STREAM);sk.settimeout(5);sk.connect(addrs[0][4])
+               print('proxy_'+label+'_tcp=PASS elapsed_ms='+str(round((time.monotonic()-t)*1000)))
+              except OSError as e:print('proxy_'+label+'_tcp=FAIL_'+type(e).__name__)
+              finally:
+               if sk:sk.close()
+             except socket.gaierror:print('proxy_'+label+'_dns=UNAVAILABLE')
+            except_marker='none'
+            try:
+             with socket.create_connection(('www.cloudflare.com',443),timeout=5) as sk:print('general_egress_tcp443=PASS')
+            except OSError as e:print('general_egress_tcp443=FAIL_'+type(e).__name__)
             PY
-            echo '=== SYSTEMD ==='
+            echo '=== Xray active ==='
             systemctl is-active xray-racknerd-443
-            echo '=== FINISHED ==='
